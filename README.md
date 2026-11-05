@@ -2,7 +2,7 @@
 
 An OpenCode-style local coding agent: a Node.js/TypeScript agent engine, a Vue 3
 chat workspace, and Tauri 2 shells for desktop and mobile. It **reuses the
-SQLite database copied from `D:\laragon\www\playground\freellmapi_bak`**, so the
+SQLite database copied from `freellmapi`**, so the
 108-model catalogue, 16 encrypted provider keys, fallback configuration and
 usage history all come along for the ride.
 
