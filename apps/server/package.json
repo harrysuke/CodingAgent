@@ -1,0 +1,34 @@
+{
+  "name": "@codingagent/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=dist/index.js --sourcemap",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/index.js",
+    "db:migrate": "tsx src/db/cli.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "1.0.61",
+    "@codingagent/shared": "*",
+    "@hono/node-server": "^1.19.0",
+    "ai": "5.0.285",
+    "better-sqlite3": "^12.4.1",
+    "diff": "^7.0.0",
+    "dotenv": "^17.2.2",
+    "execa": "^9.6.0",
+    "fast-glob": "^3.3.3",
+    "hono": "^4.13.16",
+    "ignore": "^7.0.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.18.6",
+    "esbuild": "^0.25.10",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}

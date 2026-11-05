@@ -1,0 +1,40 @@
+{
+  "name": "codingagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An OpenCode-style coding agent: Node.js + TypeScript engine, Vue 3 UI, Tauri 2 desktop & mobile shells",
+  "type": "module",
+  "workspaces": [
+    "packages/shared",
+    "apps/server",
+    "apps/web",
+    "apps/desktop"
+  ],
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "build:shared": "npm run build -w @codingagent/shared",
+    "dev": "npm run build:shared && concurrently --kill-others-on-fail --names server,web \"npm run dev -w @codingagent/server\" \"npm run dev -w @codingagent/web\"",
+    "dev:server": "npm run build:shared && npm run dev -w @codingagent/server",
+    "dev:web": "npm run build:shared && npm run dev -w @codingagent/web",
+    "build": "npm run build:shared && npm run build -w @codingagent/server && npm run build -w @codingagent/web",
+    "start": "npm run start -w @codingagent/server",
+    "typecheck": "npm run build:shared && npm run typecheck -w @codingagent/server && npm run typecheck -w @codingagent/web",
+    "db:migrate": "npm run build:shared && npm run db:migrate -w @codingagent/server",
+    "desktop:dev": "npm run build:shared && npm run desktop:dev -w @codingagent/desktop",
+    "desktop:build": "node scripts/prepare-desktop.mjs && npm run desktop:build -w @codingagent/desktop",
+    "desktop:check": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml",
+    "verify:desktop": "node scripts/verify-desktop-runtime.mjs",
+    "mobile:android:init": "npm run mobile:android:init -w @codingagent/desktop",
+    "mobile:ios:init": "npm run mobile:ios:init -w @codingagent/desktop",
+    "mobile:android:dev": "npm run mobile:android:dev -w @codingagent/desktop",
+    "mobile:ios:dev": "npm run mobile:ios:dev -w @codingagent/desktop",
+    "smoke": "node scripts/smoke-test.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}
