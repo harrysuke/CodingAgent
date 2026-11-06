@@ -10,13 +10,13 @@ export interface ResolvedModel {
   modelId: string;
 }
 
-/** Build an AI SDK language model from a row in the reused `models` table. */
-export function resolveModel(platform: Platform, modelId: string): ResolvedModel {
-  const credential = resolveCredential(platform);
+/** Build an AI SDK language model from this account's key ring. */
+export function resolveModel(platform: Platform, modelId: string, userId: string): ResolvedModel {
+  const credential = resolveCredential(platform, userId);
   if (!credential) {
     throw new Error(
-      `No enabled API key for "${platform}". Add one in Settings > Providers, ` +
-      'or pick a model whose provider is already configured.',
+      `No enabled API key for "${platform}" on your account. CodingAgent is BYOK: ` +
+      'add your own key in Settings > Providers & keys, then pick a model from that provider.',
     );
   }
   const endpoint = resolveEndpoint(platform, credential.apiKey, platform === 'custom' ? credential.baseUrl : undefined);
@@ -29,7 +29,7 @@ export function resolveModel(platform: Platform, modelId: string): ResolvedModel
   return { model: provider.chatModel(modelId), platform, modelId };
 }
 
-/** True when the platform has a usable credential (used by the model picker). */
-export function canUse(platform: Platform): boolean {
-  return resolveCredential(platform) !== null;
+/** True when this account has a usable credential for the platform. */
+export function canUse(platform: Platform, userId: string): boolean {
+  return resolveCredential(platform, userId) !== null;
 }

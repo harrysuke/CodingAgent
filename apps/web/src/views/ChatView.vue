@@ -2,16 +2,18 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
   PanelLeft, PanelRight, FileCode2, X, Sparkles, Bug, BookOpen, TestTube2,
-  CircleDot, Copy, Check, Terminal,
+  CircleDot, Copy, Check, Terminal, KeyRound, ArrowRight,
 } from 'lucide-vue-next';
+import { useRouter } from 'vue-router';
 import { useAppStore } from '../stores/app';
-import { apiFetch } from '../api/client';
+import { apiFetch, auth } from '../api/client';
 import MessageItem from '../components/MessageItem.vue';
 import Composer from '../components/Composer.vue';
 import RightPanel from '../components/RightPanel.vue';
 import TerminalPanel from '../components/TerminalPanel.vue';
 
 const store = useAppStore();
+const router = useRouter();
 const scroller = ref<HTMLElement | null>(null);
 const composer = ref<InstanceType<typeof Composer> | null>(null);
 const rightOpen = ref(true);
@@ -27,6 +29,8 @@ const suggestions = [
 
 const messages = computed(() => store.messages);
 const showEmpty = computed(() => !messages.value.length && !store.running);
+/** BYOK onboarding: no key and no keyless provider means chat cannot start. */
+const needsOwnKey = computed(() => !!auth.user && auth.user.keyCount === 0 && store.usableModels.length === 0);
 
 function scrollToBottom(smooth = false) {
   void nextTick(() => {
@@ -131,6 +135,18 @@ async function copyAll() {
               <div class="h-2" />
             </template>
           </div>
+        </div>
+
+        <!-- BYOK onboarding -->
+        <div v-if="needsOwnKey" class="mx-3 sm:mx-5 mb-2 flex items-start gap-3 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)] px-3.5 py-3 text-[11.5px] text-[var(--amber)]">
+          <KeyRound :size="16" class="shrink-0 mt-0.5" />
+          <div class="min-w-0 flex-1 leading-relaxed">
+            <div class="font-semibold">Add your own API key to start chatting</div>
+            <div class="mt-0.5 opacity-90">This account has no provider keys. CodingAgent is bring-your-own-key, so nobody else's quota is used to answer your prompts.</div>
+          </div>
+          <button class="shrink-0 flex items-center gap-1 rounded-lg border border-[var(--amber)]/40 px-2.5 py-1.5 text-[11px] font-medium hover:bg-[var(--amber)]/10" @click="router.push({ path: '/settings', query: { section: 'providers' } })">
+            Add key <ArrowRight :size="12" />
+          </button>
         </div>
 
         <TerminalPanel v-if="store.terminalOpen" @close="store.terminalOpen = false" />

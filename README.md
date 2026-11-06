@@ -2,12 +2,13 @@
 
 An OpenCode-style local coding agent: a Node.js/TypeScript agent engine, a Vue 3
 chat workspace, and Tauri 2 shells for desktop and mobile. It **reuses the
-SQLite database copied from `D:\laragon\www\playground\freellmapi_bak`**, so the
-108-model catalogue, 16 encrypted provider keys, fallback configuration and
-usage history all come along for the ride.
+SQLite model catalogue copied from `freellmapi`** (108 models, fallback
+configuration, provider registry).
 
 Everything runs on your machine. The UI talks to a localhost HTTP + SSE API;
-no cloud service, no account, no telemetry.
+no cloud service, no telemetry. **Accounts are local and BYOK**: everyone signs
+in before any request is accepted, and every account can only spend its own
+provider API keys. There is no shared access token and no shared quota.
 
 ---
 
@@ -15,14 +16,16 @@ no cloud service, no account, no telemetry.
 
 ```
 D:\Nodejs\CodingAgent
-├── data/codingagent.db          <- renamed copy of freeapi.db (VACUUM INTO)
+├── data/codingagent.db          <- renamed copy of freeapi.db (VACUUM INTO), GITIGNORED
 ├── packages/shared              <- Zod schemas + TS contracts (server & UI)
 ├── apps/server                  <- Hono HTTP/SSE + agent loop + workspace tools
+│   ├── src/auth/                 scrypt passwords, account sessions, BYOK ownership
 │   ├── src/workspace/            sandbox paths, file ops, folder browser, attachments
 │   ├── src/terminal/             persistent shell sessions streamed over SSE
 │   ├── src/skills/               SKILL.md registry, installer, prompt injection
 │   └── dist/index.js             esbuild bundle (--packages=external)
 ├── apps/web                     <- Vue 3 + Vite + Pinia + Tailwind + Shiki
+│   ├── src/views/AuthView.vue    sign-in / registration / first-run owner setup
 │   └── dist                      served by Vite (dev) or Node (prod/desktop)
 ├── apps/desktop/src-tauri       <- Tauri 2 Rust shell (desktop + mobile)
 │   ├── src/lib.rs                sidecar supervisor + IPC commands
@@ -71,14 +74,77 @@ Inherited tables are used as-is: `models`, `api_keys`, `settings`,
 Agent state is **additive** so nothing collides with the source schema (notably
 its auth `sessions` table):
 
-`agent_sessions`, `agent_messages`, `agent_parts`, `agent_permissions`,
-`agent_permission_grants`, `agent_todos`, `agent_file_changes`, `projects`.
-`requests` gains `session_id` / `agent` columns for telemetry.
+`projects`, `agent_sessions`, `agent_messages`, `agent_parts`,
+`agent_permissions`, `agent_permission_grants`, `agent_todos`,
+`agent_file_changes`, plus the account tables `agent_users`,
+`agent_user_sessions`, `agent_user_settings`. `requests` gains `session_id`,
+`agent` and `user_id` columns for telemetry.
 
-> **Keep `ENCRYPTION_KEY` safe.** The 16 provider keys in the copied DB are
-> AES-256-GCM encrypted with the source project's key. `npm run setup` reads
-> that key from `freellmapi_bak/.env` into the new `.env`. If you lose it, the
-> keys cannot be decrypted — back it up before rotating.
+`api_keys`, `projects`, `agent_sessions`, `agent_permissions` and `requests`
+all carry a nullable `user_id`. Rows created before accounts existed stay
+invisible until the first admin claims them; every query filters on `user_id`,
+so a `NULL` row can never be reached by a regular account.
+`agent:active_project` and all other preferences now live in
+`agent_user_settings`, never in the global `settings` table.
+
+> **Keep `ENCRYPTION_KEY` safe.** Provider keys are AES-256-GCM encrypted with
+> the key in `.env`. `npm run setup` reads it from `freellmapi_bak/.env` into
+> the new `.env`; if you lose it, pre-existing keys cannot be decrypted.
+>
+> **Never commit the database or a backup of it.** `.gitignore` excludes
+> `*.db`, `*.db-wal`, `*.db-shm`, `*.sqlite*`, the whole `data/` runtime
+> directory (including `.zip` DB backups), and `.env`. `data/codingagent.db`
+> holds encrypted API keys, password hashes and chat history. Rotate the setup
+> token with `npm run rotate:setup-token` before exposing a fresh server to a
+> LAN.
+
+---
+
+## Accounts, login and BYOK
+
+The old model (`AGENT_TOKEN` pasted into every client) is gone. Anyone who
+reached the server could spend the owner's keys. Now:
+
+| Stage | What happens |
+| --- | --- |
+| First run | `/api/auth/status` reports `needsSetup: true`. The UI shows a **Create owner account** form that requires the one-time setup token (`AGENT_TOKEN` from `.env`, or `<app-data>/server.env` on desktop). This stops a stranger on the LAN from registering first and claiming the owner's keys. |
+| Owner account | Becomes the only admin. It claims every pre-existing unowned row (provider keys, projects, sessions, telemetry) so an upgrade does not lose data. |
+| Later accounts | Register with an email + password (or are handed an account with `ALLOW_REGISTRATION=false`). They start with **zero provider keys**, their own settings, and a private workspace under `data/workspaces/<userId>`. |
+| Every request | Carries a per-account bearer session token. Only that account's keys, projects, sessions, permissions, settings and usage are visible. A `401` clears the local session and returns to sign-in. |
+| Model calls | `resolveCredential(platform, userId)` looks **only** in that account's key ring — there is no global fallback. With no usable key the chat shows a BYOK banner and the agent loop refuses the turn. |
+
+Security details:
+
+- Passwords use `scrypt` (`scrypt$<salt>$<hash>`) with `timingSafeEqual`.
+- Session tokens are 32 random bytes; **only their SHA-256 hash** is stored, so a
+  DB dump cannot be replayed as a live login. Changing a password invalidates
+  every session for that account. Failed logins are throttled per process.
+- `AGENT_TOKEN` is **not an API credential** any more. It is only the one-time
+  first-admin setup secret (and the desktop sidecar's startup hint).
+- Provider keys are AES-256-GCM encrypted, scoped by `api_keys.user_id`, and
+  never returned in plaintext (only a masked preview).
+- Non-admin accounts are confined to `data/workspaces/<userId>`. Workspace
+  roots, project roots, attachments and tool paths all pass textual **and**
+  realpath containment checks, so a symlink out to the host `.env` is refused.
+- Shell access is **disabled by default** for non-admin accounts, because a
+  shell can `cd ..` out of any in-process path sandbox. Set
+  `AGENT_ALLOW_USER_SHELL=true` only if you fully trust every account.
+- Terminal sessions carry their owner id; another account gets a 404.
+
+Relevant `.env` settings (see `.env.example`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AGENT_TOKEN` | random from `npm run setup` | one-time first-admin setup secret |
+| `ALLOW_REGISTRATION` | `true` | set `false` to close public sign-up |
+| `AGENT_SESSION_TTL_DAYS` | `30` | login session lifetime |
+| `USER_WORKSPACES_ROOT` | `./data/workspaces` | per-account sandbox root |
+| `AGENT_ALLOW_USER_SHELL` | `false` | allow the terminal for non-admin accounts |
+
+Auth endpoints: `GET /api/auth/status` (public), `POST /api/auth/register`,
+`POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`,
+`POST /api/auth/password`. `GET /api/health` is public but deliberately sparse
+until authenticated (no DB path, no workspace path, no key counts).
 
 ---
 
@@ -102,7 +168,10 @@ npm run setup      # copies freeapi.db -> data/codingagent.db and writes .env
 ```
 
 `setup` is idempotent and inherits the source project's `ENCRYPTION_KEY`, which
-is required to decrypt the 16 provider keys already stored in the database.
+is required to decrypt the provider keys already stored in the database. It also
+writes a **fresh random `AGENT_TOKEN`** — save that line. On the first visit to
+the app you will create the owner account with it, then add your own provider
+keys under **Settings → Account / Providers & keys**.
 
 ### 2. Run in the browser (development — the usual loop)
 
@@ -111,7 +180,8 @@ npm run dev
 ```
 
 Open <http://localhost:5173>. Vite serves the Vue UI and proxies `/api` to the
-agent server on **http://127.0.0.1:4317** (tsx watch, restarts on change).
+agent server on **http://127.0.0.1:4317** (tsx watch, restarts on change). On a
+fresh database the UI opens the owner-setup screen instead of the chat.
 
 ### 3. Run as a single-origin production server
 
@@ -146,7 +216,7 @@ npm run desktop:build    # real app + installer (release build)
 The phone has no Node runtime, so point it at a server running on your machine:
 
 ```bash
-# in .env on the host: HOST=0.0.0.0  (and optionally a long AGENT_TOKEN), then:
+# in .env on the host: HOST=0.0.0.0
 npm start               # note the host LAN IP, e.g. 192.168.1.50:4317
 
 npm run mobile:android:init    # needs Android SDK + NDK
@@ -156,45 +226,62 @@ npm run mobile:ios:init && npm run mobile:ios:dev
 ```
 
 In the app open **Settings → Connection**, set **Server URL** to
-`http://192.168.1.50:4317` and paste the same `AGENT_TOKEN`. Allow port 4317
-through the host firewall. Mobile never starts a sidecar, so these settings are
-always used.
+`http://192.168.1.50:4317`, then **sign in** (or register) in the app. You do
+**not** paste `AGENT_TOKEN` — that is only for creating the very first admin
+account. New accounts must add their own key under **Settings → Providers &
+keys**. Allow port 4317 through the host firewall. Mobile never starts a
+sidecar, so these settings are always used.
+
+> Binding `0.0.0.0` exposes the login page to your LAN. Rotate the setup token
+> first, and set `ALLOW_REGISTRATION=false` if you do not want new sign-ups.
 
 ### 6. Verify the install
 
 ```bash
 npm run typecheck          # shared + server tsc, web vue-tsc
-npm run smoke              # 16 API checks against the running server
-npm run smoke -- --chat --tools   # + live LLM turn and tool/permission flow
-npm run verify:desktop     # boots the packaged runtime, 13 checks
+npm run smoke              # isolated server, 62 checks (accounts, BYOK, isolation, tools)
+npm run smoke -- --chat --tools   # + live LLM turn and tool/permission flow (71 checks)
+npm run verify:desktop     # boots the packaged runtime, 35 checks incl. privacy audit
 npm run desktop:check      # cargo check the Rust shell
 ```
 
-> **Token gotcha:** the UI authenticates with `AGENT_TOKEN` (default
-> `change-me-local-dev-token`). If you change it in `.env`, also update it in
-> **Settings → Connection**. The desktop app injects it automatically.
+`npm run smoke` no longer needs a running server: it boots its own isolated
+instance with a throwaway DB copy, a temporary workspace and a random setup
+token, so the real database is never touched.
+
+> **Setup-token gotcha:** `AGENT_TOKEN` is needed **once**, to create the first
+> admin account. If it is still the shipped placeholder, rotate it with
+> `npm run rotate:setup-token` and restart before anyone else can reach the
+> server. After that, sign-in uses an email + password and a browser-held
+> session token — there is no access token to paste into Settings.
 
 ### Scripts
 
 | Command | What it does |
 | --- | --- |
 | `npm run setup` | Idempotent DB snapshot + `.env` generation |
+| `npm run rotate:setup-token` | Replace `AGENT_TOKEN` with a fresh random secret |
 | `npm run dev` | Server (tsx watch) + Vite dev server |
 | `npm run build` | Build shared → server bundle → Vue app |
 | `npm start` | Serve the built UI and API from Node |
 | `npm run typecheck` | Shared + server `tsc` + `vue-tsc` |
 | `npm run db:migrate` | Apply the additive `agent_*` schema |
-| `npm run smoke` | 16 API smoke checks |
-| `npm run smoke -- --chat --tools` | Live LLM streaming + permission/tool flow |
+| `npm run smoke` | 62 isolated API checks (accounts, BYOK, isolation, tools) |
+| `npm run smoke -- --chat --tools` | + live LLM streaming + permission/tool flow (71) |
 | `npm run desktop:dev` | Tauri dev window (uses the Vite dev server) |
-| `npm run desktop:build` | Assemble runtime + build the desktop installer |
+| `npm run desktop:build` | Assemble a **BYOK-only** runtime + build the installer |
+| `npm run desktop:build:private` | Same, but keeps your encrypted keys (`--include-keys`) — **never redistribute** |
 | `npm run desktop:check` | `cargo check` the Rust shell |
-| `npm run verify:desktop` | Boot the *packaged* runtime and exercise its API |
+| `npm run verify:desktop` | Boot the *packaged* runtime, audit DB privacy, exercise its API |
 
 ---
 
 ## Agent features
 
+- **Accounts + BYOK.** Local sign-in, a one-time owner setup token, per-account
+  encrypted provider keys, per-account sessions/projects/settings/usage, and a
+  private workspace sandbox for every non-admin account. See
+  [Accounts, login and BYOK](#accounts-login-and-byok).
 - **Workspace as a sandbox.** The folder button at the left of the composer's
   picker row (next to the model selectbox) opens an OpenCode-style browser: drive
   roots, breadcrumbs, git-repo badges, recents, and a manual path field. Opening a
@@ -231,9 +318,10 @@ npm run desktop:check      # cargo check the Rust shell
   highlighting, usage analytics, provider-key manager, light/dark theme,
   responsive mobile layout.
 
-The API is token-gated (`AGENT_TOKEN`) and CORS-open so Tauri and mobile
-WebViews can reach a loopback/LAN server. Endpoints live under `/api`:
-`health`, `models`, `providers`, `keys`, `settings`, `analytics`, `projects`,
+Every `/api` endpoint except `health` and `auth/status|login|register` requires a
+per-account bearer session; CORS stays open so Tauri and mobile WebViews can
+reach a loopback/LAN server. Endpoints live under `/api`:
+`auth/*`, `health`, `models`, `providers`, `keys`, `settings`, `analytics`, `projects`,
 `workspace`, `workspace/browse`, `workspace/open`, `attachments/resolve`,
 `skills`, `skills/install`, `skills/:id`, `terminal`, `terminal/:id/*`,
 `sessions`, `sessions/:id/chat|abort|events|permissions`, `permissions/:id/resolve`,
@@ -245,13 +333,17 @@ WebViews can reach a loopback/LAN server. Endpoints live under `/api`:
 
 ### 1. Workspace = the agent's sandbox root
 
-`POST /api/workspace/open` validates the folder, reuses (or creates) the
-`projects` row, and stores `agent:active_project` in `settings`. From then on:
+`POST /api/workspace/open` validates the folder, reuses (or creates) a
+user-owned `projects` row, and stores `agent:active_project` in
+`agent_user_settings` for the signed-in account. From then on:
 
 - new sessions attach to that project, and `rootFor()` / `activeRoot()` resolve
   every file tool against it;
 - `resolveSafe` rejects `..`, absolute paths outside the root, and symlinks whose
   real target leaves the root;
+- non-admin accounts can only open folders inside `data/workspaces/<userId>`;
+  both textual and realpath containment are checked, so a symlink cannot widen
+  the sandbox;
 - `/api/workspace/browse` is a directory-only browser (drives on Windows, common
   roots elsewhere) so the picker works in a browser, the desktop shell and on a
   phone.
@@ -308,9 +400,30 @@ npm run desktop:build    # produces NSIS/MSI (Windows), dmg (macOS), deb/AppImag
 `scripts/prepare-desktop.mjs` assembles a self-contained runtime under
 `apps/desktop/src-tauri/resources/`: a **single-file esbuild bundle** of the
 server (all JS dependencies inlined, only the native `better-sqlite3` addon kept
-external), a clean DB snapshot, the built Vue app, a portable `node.exe`/`node`,
-and the `.env`. That keeps the resource tree at ~370 files / ~23 MB instead of
-copying the whole dependency closure.
+external), a **sanitized** DB snapshot, the built Vue app, a portable
+`node.exe`/`node`, and a freshly generated `.env`. That keeps the resource tree
+at ~370 files / ~23 MB instead of copying the whole dependency closure.
+
+**The packaged database is stripped, and that is deliberate.** The source DB is
+your live one: it contains chat history, usage telemetry, absolute project
+paths, the inherited dashboard user's password hash + session tokens, and a
+plaintext `unified_api_key`. The snapshot keeps only the model catalogue,
+fallback config and harmless preference defaults, then runs `VACUUM` so purged
+rows cannot be recovered from free pages. Provider keys are **not** shipped and
+`ENCRYPTION_KEY` / `AGENT_TOKEN` are regenerated per build — an installer is
+therefore BYOK-only and safe to hand to someone else. The first-run screen
+prefills the fresh setup token, and the new owner adds their own key.
+
+For a **private** build that keeps your own encrypted keys (and the source
+`ENCRYPTION_KEY` needed to decrypt them), use `npm run desktop:build:private`
+(`--include-keys`). Such an installer effectively contains your API keys — never
+redistribute it. `npm run verify:desktop` audits the shipped DB for all of the
+above and adapts its assertions to either build mode.
+
+The packaging script also preflights the `better-sqlite3` native ABI. If npm
+launched it with a Node built against a different `NODE_MODULE_VERSION`, it
+re-execs under a compatible Node (or fails with a clear `CA_NODE_BIN` hint), so
+the bundled `node.exe` can always load the addon.
 
 On startup (every built binary, debug or release) `src/lib.rs`:
 
@@ -319,21 +432,24 @@ On startup (every built binary, debug or release) `src/lib.rs`:
    `~/Library/Application Support/com.codingagent.app` on macOS,
    `~/.local/share/com.codingagent.app` on Linux).
 2. Seeds `server.env`, `data/codingagent.db` and `workspace/` from the bundled
-   copies on first run. **Your sessions and files live there**, not in the
-   install directory.
+   copies on first run. **Your sessions, keys and files live there**, not in the
+   install directory. A stale `agent:active_project` from another machine is
+   discarded at first-admin setup, so `WORKSPACE_ROOT` always wins.
 3. Picks a free loopback port, spawns the bundled Node with real environment
    variables (`PORT`, `HOST`, `DB_PATH`, `WORKSPACE_ROOT`, `AGENT_TOKEN`,
    `ENCRYPTION_KEY` — dotenv never overrides them), and polls `/api/health`
    with a raw TCP probe.
-4. Answers `get_server_config` with `{ url, token }`; the Vue client stores that
-   and uses it for every request. `get_server_status` exposes startup
-   diagnostics. Server stdout/stderr goes to `<app-data>/server.log`.
+4. Answers `get_server_config` with `{ url, token }`. The Vue client treats
+   `token` as a **one-time setup-token hint** for the first-run owner screen,
+   not as a bearer credential; after login all requests carry the account's
+   session token. `get_server_status` exposes startup diagnostics. Server
+   stdout/stderr goes to `<app-data>/server.log`.
 5. Kills the child on application exit.
 
 `tauri dev` skips the sidecar and uses the Vite proxy (detected through the
 `dev` cfg emitted by tauri-build). To force the sidecar in dev, set
-`CODINGAGENT_FORCE_SIDECAR=1`. Edit `<app-data>/server.env` to
-change the token or encryption key, then restart the app.
+`CODINGAGENT_FORCE_SIDECAR=1`. Edit `<app-data>/server.env` to change the setup
+token or encryption key, then restart the app — existing sessions are unaffected.
 
 ---
 
@@ -345,16 +461,17 @@ server** you already run:
 ```bash
 # On the host machine (.env), then restart the server:
 HOST=0.0.0.0               # bind the LAN interface
-AGENT_TOKEN=<a-long-random-secret>
+ALLOW_REGISTRATION=false    # optional: only hand out accounts yourself
 
 npm start                  # note the host LAN IP, e.g. 192.168.1.50:4317
 ```
 
 CORS is already permissive (the server replies `Access-Control-Allow-Origin: *`
-to token-gated API calls), so no extra origin configuration is needed.
+to authenticated API calls), so no extra origin configuration is needed.
 
 Then, in the app: **Settings → Connection → Server URL** =
-`http://192.168.1.50:4317` and the same access token. The Rust
+`http://192.168.1.50:4317`, and sign in with your account. Each account must
+add its own key under **Settings → Providers & keys**. The Rust
 `get_server_config` command returns `null` on mobile, so the saved settings are
 always used. Hash routing, fetch-based SSE (with `Authorization` header) and
 safe-area padding are all mobile-friendly.
@@ -376,24 +493,39 @@ The generated `src-tauri/gen/android` / `gen/ios` projects are gitignored.
 | Check | Result |
 | --- | --- |
 | `PRAGMA integrity_check` on `codingagent.db` | `ok` |
-| Migration | 19 tables, 108 models, 16 keys, 1 default project |
-| `npm run smoke` | 29 passed / 0 failed (includes workspace, attachment, skill and terminal checks) |
-| `npm run smoke -- --chat` | 33 passed / 0 failed; live Groq stream, 53 SSE events |
-| `npm run smoke -- --chat --tools` | 34 passed / 0 failed; permission → `write` → diff recorded |
+| Migration | additive account/ownership tables, 108 models, account-scoped keys |
+| `npm run typecheck` | pass (shared `tsc`, server `tsc`, web `vue-tsc`) |
+| `npm run build` | pass (shared + server bundle + Vue dist) |
+| `npm run smoke` | **62 passed / 0 failed** — isolated DB/workspace/port, first-admin setup, two-account isolation, BYOK, workspace, attachments, skills, terminal |
+| `npm run smoke -- --chat --tools` | **71 passed / 0 failed** — live LLM stream, permission → `write` → diff recorded |
+| Multi-user isolation | second account sees 0 owner keys/models/sessions, gets 404 on owner chat/SSE, cannot escape its workspace, cannot spawn a shell, can add its own key |
+| `npm run verify:desktop` | **35 passed / 0 failed** — packaged Node + server + sanitized DB, privacy audit, first-admin setup, BYOK end to end |
+| `npm run verify:desktop` against `--include-keys` build | **33 passed / 0 failed** — private key-bearing build, adaptive assertions |
+| `npm run desktop:check` | pass (only two harmless Windows incremental-lockfile warnings) |
+| `tauri build --debug --no-bundle` | previously pass; produced `target/debug/codingagent.exe` |
 | Live turn with attachment + skill | model read the attached `package.json` and the injected `Test First` skill; user turn persisted `text` + `attachment` parts |
-| `npm run typecheck`, `npm run build` | pass |
-| `cargo check` (Rust shell) | pass, no warnings |
-| `tauri build --debug --no-bundle` | pass; produced `target/debug/codingagent.exe` |
-| `npm run verify:desktop` | 13 passed / 0 failed; bundled Node + single-file server + copied DB |
-| `npm run verify:desktop` | packaged Node + bundled server + copied DB, full API |
 
 ### Troubleshooting
 
 - **`ENCRYPTION_KEY must be 64 hex chars`** — restore the key from
   `freellmapi_bak/.env` into `.env` (or `<app-data>/server.env`) and restart.
+  Keys added on a desktop build are encrypted with that build's own fresh key,
+  so do not point a desktop install at the source project's database.
 - **Native addon error** — `npm rebuild better-sqlite3 --foreground-scripts`.
-- **Unauthorized in the UI** — the token in Settings → Connection must equal
-  `AGENT_TOKEN` / `<app-data>/server.env`.
+  On machines with several Node versions, `scripts/smoke-test.mjs` auto-detects
+  one whose ABI matches the compiled addon (or set `CA_NODE_BIN`).
+- **"Your session has expired" / bounced back to sign-in** — log in again; the
+  30-day session TTL elapsed, the password was changed, or the server was
+  restarted against a different database.
+- **Stuck on "Create owner account"** — enter the `AGENT_TOKEN` from `.env`
+  (or `<app-data>/server.env` on desktop). If it is still
+  `change-me-local-dev-token`, run `npm run rotate:setup-token` and restart.
+- **Sign-in screen says the server is out of date** — an old `dist` is still
+  being served and has no `/api/auth/*` routes. Rebuild (`npm run build`) and
+  restart; check that nothing stale is holding port 4317.
+- **"Add your own API key" banner / chat refuses to start** — BYOK is working as
+  intended. Add a key under **Settings → Providers & keys** and pick a model
+  from that provider.
 - **Desktop window is blank / offline** — check `<app-data>/server.log`; the
   sidecar readiness timeout is 30 s, `get_server_config` waits up to 20 s.
 - **Mobile cannot connect** — the server must bind `0.0.0.0`, the phone must be

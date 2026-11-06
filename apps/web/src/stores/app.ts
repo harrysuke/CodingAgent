@@ -7,7 +7,8 @@ import type {
 } from '@codingagent/shared';
 import { DEFAULT_SETTINGS } from '@codingagent/shared';
 import {
-  apiFetch, checkHealth, connection, initConnection, setConnection, streamEvents, streamTerminal,
+  apiFetch, auth, checkHealth, clearSessionToken, connection, initConnection, refreshMe,
+  restoreSession, setServerUrl, signOut as requestSignOut, streamEvents, streamTerminal,
 } from '../api/client';
 
 export interface FileChange {
@@ -101,18 +102,47 @@ export const useAppStore = defineStore('app', () => {
   async function bootstrap(): Promise<void> {
     await initConnection();
     ready.value = true;
+    // /api/health is public, so the offline screen works before login.
     const health: HealthResponse | null = await checkHealth();
-    if (!health) return;
-    await Promise.all([
-      loadSessions(), loadModels(), loadProviders(), loadKeys(), loadSettings(), loadWorkspace(),
-    ]);
-    if (sessions.value.length) {
-      await selectSession(sessions.value[0].id);
-    } else {
-      await newSession();
+    if (!health) {
+      auth.user = null;
+      auth.checked = true;
+      return;
     }
-    void loadTree();
-    void loadSkills();
+    await restoreSession();
+    if (!auth.user) return; // App.vue renders the sign-in / first-run screen.
+    await bootstrapData();
+  }
+
+  /** Wipe every account-scoped collection when switching or signing out. */
+  function resetAccountState(): void {
+    stopEvents();
+    sessions.value = [];
+    messages.value = [];
+    models.value = [];
+    providers.value = [];
+    keys.value = [];
+    permissions.value = [];
+    todos.value = [];
+    fileChanges.value = [];
+    fileTree.value = [];
+    analytics.value = null;
+    workspace.value = null;
+    attachments.value = [];
+    skills.value = [];
+    terminalId.value = null;
+    terminalLines.value = [];
+    currentId.value = null;
+    error.value = '';
+    running.value = false;
+  }
+
+  async function refreshUser(): Promise<void> { await refreshMe(); }
+
+  async function signOut(): Promise<void> {
+    await requestSignOut();
+    resetAccountState();
+    clearSessionToken();
   }
 
   async function loadSessions(): Promise<void> {
@@ -598,25 +628,33 @@ export const useAppStore = defineStore('app', () => {
   async function addKey(input: { platform: string; key: string; label?: string; baseUrl?: string }): Promise<void> {
     await apiFetch('/api/keys', { method: 'POST', body: JSON.stringify(input) });
     await Promise.all([loadKeys(), loadProviders(), loadModels()]);
+    // The server picks a default model on the account's first key, so refresh
+    // settings and keyCount too (the BYOK onboarding banner depends on both).
+    await Promise.all([loadSettings(), refreshUser()]);
   }
 
   async function toggleKey(id: number, enabled: boolean): Promise<void> {
     await apiFetch(`/api/keys/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled }) });
-    await Promise.all([loadKeys(), loadProviders(), loadModels()]);
+    await Promise.all([loadKeys(), loadProviders(), loadModels(), refreshUser()]);
   }
 
   async function removeKey(id: number): Promise<void> {
     await apiFetch(`/api/keys/${id}`, { method: 'DELETE' });
-    await Promise.all([loadKeys(), loadProviders(), loadModels()]);
+    await Promise.all([loadKeys(), loadProviders(), loadModels(), refreshUser()]);
   }
 
-  async function applyConnection(url: string, token: string): Promise<boolean> {
-    setConnection(url, token);
+  /**
+   * A session token belongs to one server, so changing the URL always signs
+   * out and returns the user to the login screen for that server.
+   */
+  async function applyConnection(url: string): Promise<boolean> {
+    setServerUrl(url);
+    clearSessionToken();
+    auth.user = null;
+    resetAccountState();
     const health = await checkHealth();
     if (!health) return false;
-    stopEvents();
-    await bootstrapData();
-    if (currentId.value) connectEvents(currentId.value);
+    await restoreSession();
     return true;
   }
 
@@ -651,6 +689,6 @@ export const useAppStore = defineStore('app', () => {
     ensureTerminal, sendTerminal, interruptTerminal, clearTerminal, closeTerminal, toggleTerminal,
     newSession, selectSession, send, abort, resolvePermission, renameSession, deleteSession,
     setModel, setAgent, saveSettings, addKey, toggleKey, removeKey,
-    applyConnection, clearError, checkHealth,
+    applyConnection, clearError, checkHealth, bootstrapData, refreshUser, signOut,
   };
 });

@@ -5,11 +5,12 @@ import {
   getModel, getProject, getSession, getSettings, logRequest, setHistory, touchSession, updatePart, updateSession,
 } from '../db/repo';
 import { resolveModel } from '../llm/client';
+import type { Actor } from '../auth/service';
 import { abortAllPermissions, emit } from './bus';
 import { buildSystemPrompt, buildTitlePrompt } from './prompt';
 import { createTools, type ToolContext } from './tools';
 import { formatAttachmentBlock, resolveAttachments } from '../workspace/attachments';
-import { activeRoot, gitBranch } from '../workspace/registry';
+import { activeRoot, gitBranch, safeRoot } from '../workspace/registry';
 import { activeSkills, allowedToolsFor, mergeToolDefaults } from '../skills/registry';
 
 const running = new Map<string, AbortController>();
@@ -30,6 +31,8 @@ function send(sessionId: string, event: AgentEvent): void { emit(sessionId, even
 export interface RunInput {
   sessionId: string;
   request: ChatRequest;
+  /** The account whose keys, workspace and settings this run may use. */
+  actor: Actor;
   /** Allows the HTTP layer to hook a fresh SSE subscriber before the run starts. */
   onReady?: () => void | Promise<void>;
 }
@@ -50,45 +53,56 @@ export async function runAgent(input: RunInput): Promise<void> {
   }
 }
 
-async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise<void> {
-  const session = getSession(sessionId);
+async function runAgentInner({ sessionId, request, actor, onReady }: RunInput): Promise<void> {
+  const { userId } = actor;
+  const session = getSession(sessionId, userId);
   if (!session) throw new Error(`Session ${sessionId} not found`);
   if (running.has(sessionId)) throw new Error('A response is already streaming for this session.');
 
-  const settings = getSettings();
+  const settings = getSettings(userId);
   const platform = request.modelPlatform ?? session.modelPlatform ?? settings.defaultPlatform;
   const modelId = request.modelId ?? session.modelId ?? settings.defaultModelId;
   if (!platform || !modelId) {
-    throw new Error('No model selected. Pick one from the model picker (Settings > Providers if none are available).');
+    throw new Error('No model selected. Add your own API key in Settings > Providers & keys, then pick a model.');
   }
   const agent: AgentMode = request.agent ?? session.agent ?? settings.agent;
-  const project = getProject(session.projectId);
+  const project = getProject(session.projectId, userId);
   // The session's project root is its sandbox. If that folder disappeared,
-  // fall back to whichever workspace is open right now.
+  // fall back to whichever workspace is open right now. A non-admin account
+  // can never be pointed outside its own workspace directory.
+  const fallbackRoot = activeRoot(actor);
   const projectRoot = project?.rootPath;
-  const root = projectRoot && projectRoot.trim() ? projectRoot : activeRoot();
+  // safeRoot() also follows symlinks, so a project row inside the sandbox that
+  // links to the host .env / database can never widen the agent's tools.
+  const root = projectRoot?.trim() ? safeRoot(actor, projectRoot) : fallbackRoot;
   const maxSteps = request.maxSteps ?? settings.maxSteps;
 
-  const chosen = getModel(platform, modelId);
+  const chosen = getModel(platform, modelId, userId);
   if (!chosen) throw new Error(`Model ${platform}/${modelId} is not in the catalog.`);
   if (!chosen.supportsTools) {
     throw new Error(`${chosen.displayName} is marked supports_tools=0 in the catalog and cannot run the agent loop. Pick a tool-capable model.`);
   }
+  if (!chosen.hasKey) {
+    throw new Error(
+      `Your account has no API key for ${platform}. CodingAgent is BYOK — add your own key in Settings > Providers & keys to use this model.`,
+    );
+  }
 
-  // Candidate chain: selected model first, then the reused fallback_config ordering.
+  // Candidate chain: selected model first, then the reused fallback_config
+  // ordering, filtered to providers this account actually owns a key for.
   const candidates = [
     chosen,
-    ...getFallbackChain(5).filter(m => !(m.platform === platform && m.modelId === modelId)),
+    ...getFallbackChain(userId, 5).filter(m => !(m.platform === platform && m.modelId === modelId)),
   ].slice(0, 4);
 
   const controller = new AbortController();
   running.set(sessionId, controller);
   touchSession(sessionId, 'running');
-  send(sessionId, { type: 'session', session: getSession(sessionId)! });
+  send(sessionId, { type: 'session', session: getSession(sessionId, userId)! });
 
   // Persist the user turn: the visible text, plus exactly which files were
   // pinned to it (the content itself stays out of the DB, only a preview).
-  const resolvedAttachments = resolveAttachments(root, request.attachments ?? []);
+  const resolvedAttachments = resolveAttachments(root, request.attachments ?? [], actor);
   const attachmentBlock = formatAttachmentBlock(resolvedAttachments.attachments, resolvedAttachments.errors);
 
   const userParts: Array<Partial<Part>> = [];
@@ -119,7 +133,7 @@ async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise
   if (session.title === 'New session' || !session.title) {
     // A file-only turn still deserves a readable title.
     const titleSource = request.text.trim() || resolvedAttachments.attachments[0]?.name || 'New session';
-    const titled = updateSession(sessionId, { title: buildTitlePrompt(titleSource) });
+    const titled = updateSession(userId, sessionId, { title: buildTitlePrompt(titleSource) });
     if (titled) send(sessionId, { type: 'session', session: titled });
   }
 
@@ -134,6 +148,8 @@ async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise
   const skills = activeSkills(root);
   const toolCtx: ToolContext = {
     sessionId,
+    userId,
+    allowShell: actor.allowShell,
     assistantMessageId: assistantMessage.id,
     root,
     agent,
@@ -183,7 +199,7 @@ async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise
     };
 
     try {
-      const resolved = resolveModel(candidate.platform, candidate.modelId);
+      const resolved = resolveModel(candidate.platform, candidate.modelId, userId);
       const result = streamText({
         model: resolved.model,
         system,
@@ -267,7 +283,7 @@ async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise
               send(sessionId, { type: 'usage', usage: u });
               logRequest({
                 platform: candidate.platform, modelId: candidate.modelId, status: 'success', sessionId,
-                inputTokens: u.inputTokens, outputTokens: u.outputTokens, latencyMs: Date.now() - startedAt, agent,
+                inputTokens: u.inputTokens, outputTokens: u.outputTokens, latencyMs: Date.now() - startedAt, agent, userId,
               });
             }
             break;
@@ -314,7 +330,7 @@ async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise
       }
       logRequest({
         platform: candidate.platform, modelId: candidate.modelId, status: 'error', sessionId,
-        latencyMs: Date.now() - startedAt, error: lastError.slice(0, 500), agent,
+        latencyMs: Date.now() - startedAt, error: lastError.slice(0, 500), agent, userId,
       });
       // Only retry when nothing was streamed yet, so we never duplicate output.
       if (emittedOutput || index === candidates.length - 1) break;
@@ -326,7 +342,7 @@ async function runAgentInner({ sessionId, request, onReady }: RunInput): Promise
   running.delete(sessionId);
   const finalStatus = succeeded ? 'idle' : 'error';
   touchSession(sessionId, finalStatus);
-  const finalSession = getSession(sessionId)!;
+  const finalSession = getSession(sessionId, userId)!;
   send(sessionId, { type: 'session', session: finalSession });
 
   if (!succeeded && lastError) {

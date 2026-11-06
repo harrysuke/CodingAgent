@@ -3,10 +3,11 @@ import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
   Plus, Search, Settings, MessageSquare, Trash2, Moon, Sun, Wifi, WifiOff,
-  PanelLeftClose, Code2, CircleDot, X,
+  PanelLeftClose, Code2, CircleDot, X, LogOut, KeyRound, ShieldCheck,
 } from 'lucide-vue-next';
 import { storeToRefs } from 'pinia';
 import { useAppStore } from '../stores/app';
+import { auth } from '../api/client';
 import type { Session } from '@codingagent/shared';
 
 const store = useAppStore();
@@ -122,6 +123,24 @@ function toggleTheme() {
 
     <!-- Footer -->
     <div class="border-t hairline p-2 space-y-0.5 shrink-0 safe-bottom">
+      <!-- Signed-in account + BYOK status -->
+      <div v-if="auth.user" class="mb-1 rounded-lg border hairline bg-[var(--surface)] px-2.5 py-2">
+        <div class="flex items-center gap-2 min-w-0">
+          <div class="w-7 h-7 shrink-0 rounded-lg bg-[var(--accent-soft)] text-[var(--accent-text)] grid place-items-center text-[11px] font-semibold uppercase">
+            {{ (auth.user.name || auth.user.email).slice(0, 1) }}
+          </div>
+          <div class="min-w-0 flex-1">
+            <div class="text-[11.5px] font-medium truncate">{{ auth.user.name || auth.user.email }}</div>
+            <div class="text-[10px] text-[var(--faint)] truncate">{{ auth.user.email }}</div>
+          </div>
+          <ShieldCheck v-if="auth.user.isAdmin" :size="13" class="shrink-0 text-[var(--accent-text)]" title="Administrator" />
+          <button class="shrink-0 p-1.5 rounded-md hover-soft text-[var(--muted)]" title="Sign out" @click="store.signOut()"><LogOut :size="13" /></button>
+        </div>
+        <div class="mt-1.5 flex items-center gap-1.5 text-[10px]" :class="auth.user.keyCount ? 'text-[var(--green)]' : 'text-[var(--amber)]'">
+          <KeyRound :size="11" />
+          <span>{{ auth.user.keyCount ? `${auth.user.keyCount} provider key${auth.user.keyCount === 1 ? '' : 's'} on this account` : 'No API key yet — BYOK required' }}</span>
+        </div>
+      </div>
       <div class="flex items-center gap-2 px-2 py-1.5 text-[11px]" :class="connection.connected ? 'text-[var(--green)]' : 'text-[var(--red)]'">
         <Wifi v-if="connection.connected" :size="13" /><WifiOff v-else :size="13" />
         <span class="truncate">{{ connection.connected ? `Connected${connection.health ? ` · ${connection.health.models} models` : ''}` : 'Server offline' }}</span>

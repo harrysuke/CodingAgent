@@ -12,6 +12,8 @@ type Listener = (chunk: TerminalChunk) => void;
 
 interface Session {
   id: string;
+  /** Account that created this shell; other accounts get 404 from the API. */
+  ownerId: string;
   cwd: string;
   shell: string;
   child: ChildProcessWithoutNullStreams | null;
@@ -121,7 +123,14 @@ function ensureSweeper(): void {
   sweepTimer.unref?.();
 }
 
-export function createTerminal(root: string): TerminalState {
+function owned(id: string, ownerId?: string): Session | null {
+  const session = sessions.get(id);
+  if (!session) return null;
+  if (ownerId !== undefined && session.ownerId !== ownerId) return null;
+  return session;
+}
+
+export function createTerminal(root: string, ownerId: string): TerminalState {
   ensureSweeper();
   const live = [...sessions.values()].filter(s => s.child);
   if (live.length >= MAX_TERMINALS) {
@@ -133,7 +142,7 @@ export function createTerminal(root: string): TerminalState {
   const cwd = fs.existsSync(root) ? root : process.cwd();
   const id = randomUUID();
   const session: Session = {
-    id, cwd, shell: shellFor().label, child: null, buffer: [], bufferChars: 0,
+    id, ownerId, cwd, shell: shellFor().label, child: null, buffer: [], bufferChars: 0,
     listeners: new Set(), createdAt: new Date().toISOString(), lastUsedAt: Date.now(),
   };
   sessions.set(id, session);
@@ -152,33 +161,33 @@ function toState(session: Session): TerminalState {
   };
 }
 
-export function getTerminal(id: string): TerminalState | null {
-  const session = sessions.get(id);
+export function getTerminal(id: string, ownerId?: string): TerminalState | null {
+  const session = owned(id, ownerId);
   return session ? toState(session) : null;
 }
 
-export function listTerminals(): TerminalState[] {
-  return [...sessions.values()].map(toState);
+export function listTerminals(ownerId?: string): TerminalState[] {
+  return [...sessions.values()].filter(s => ownerId === undefined || s.ownerId === ownerId).map(toState);
 }
 
-export function subscribeTerminal(id: string, listener: Listener): (() => void) | null {
-  const session = sessions.get(id);
+export function subscribeTerminal(id: string, listener: Listener, ownerId?: string): (() => void) | null {
+  const session = owned(id, ownerId);
   if (!session) return null;
   session.listeners.add(listener);
   session.lastUsedAt = Date.now();
   return () => { session.listeners.delete(listener); };
 }
 
-export function terminalBacklog(id: string): TerminalChunk[] {
-  return [...(sessions.get(id)?.buffer ?? [])];
+export function terminalBacklog(id: string, ownerId?: string): TerminalChunk[] {
+  return [...(owned(id, ownerId)?.buffer ?? [])];
 }
 
 /**
  * Send a line of input to the shell. The command is echoed back as an `input`
  * chunk so the UI shows exactly what ran even though the shell is prompt-less.
  */
-export function writeTerminal(id: string, data: string): boolean {
-  const session = sessions.get(id);
+export function writeTerminal(id: string, data: string, ownerId?: string): boolean {
+  const session = owned(id, ownerId);
   if (!session) return false;
   session.lastUsedAt = Date.now();
   const payload = data.endsWith('\n') ? data : `${data}\n`;
@@ -199,8 +208,8 @@ export function writeTerminal(id: string, data: string): boolean {
 }
 
 /** Ctrl-C: kill the whole process tree, then start a fresh shell in the same cwd. */
-export function interruptTerminal(id: string): boolean {
-  const session = sessions.get(id);
+export function interruptTerminal(id: string, ownerId?: string): boolean {
+  const session = owned(id, ownerId);
   if (!session) return false;
   session.lastUsedAt = Date.now();
   killTree(session.child);
@@ -210,8 +219,8 @@ export function interruptTerminal(id: string): boolean {
   return true;
 }
 
-export function clearTerminalBuffer(id: string): boolean {
-  const session = sessions.get(id);
+export function clearTerminalBuffer(id: string, ownerId?: string): boolean {
+  const session = owned(id, ownerId);
   if (!session) return false;
   session.buffer = [];
   session.bufferChars = 0;
@@ -219,8 +228,8 @@ export function clearTerminalBuffer(id: string): boolean {
   return true;
 }
 
-export function disposeTerminal(id: string): boolean {
-  const session = sessions.get(id);
+export function disposeTerminal(id: string, ownerId?: string): boolean {
+  const session = owned(id, ownerId);
   if (!session) return false;
   killTree(session.child);
   session.child = null;

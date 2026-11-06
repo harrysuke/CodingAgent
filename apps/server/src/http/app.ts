@@ -4,27 +4,29 @@ import { streamSSE } from 'hono/streaming';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
-  AgentEvent, BrowseResult, HealthResponse, InstallSkillResult, ResolveAttachmentsResult,
+  AgentEvent, AuthResult, BrowseResult, HealthResponse, InstallSkillResult, ResolveAttachmentsResult,
   SkillsResponse, TerminalChunk, TerminalState, WorkspaceInfo, WorkspaceState,
 } from '@codingagent/shared';
 import {
-  ChatRequestSchema, CreateKeySchema, CreateSessionSchema, InstallSkillSchema, OpenWorkspaceSchema,
-  PermissionResolveSchema, ResolveAttachmentsSchema, SettingsSchema, ToggleSkillSchema, UpdateSessionSchema,
+  ChangePasswordSchema, ChatRequestSchema, CreateKeySchema, CreateSessionSchema, InstallSkillSchema,
+  LoginSchema, OpenWorkspaceSchema, PermissionResolveSchema, RegisterSchema, ResolveAttachmentsSchema,
+  SettingsSchema, ToggleSkillSchema, UpdateSessionSchema,
 } from '@codingagent/shared';
 import { env } from '../env';
 import { getDb } from '../db/client';
 import {
   addApiKey, createProject, createSession, deleteApiKey, deleteSession, getAnalytics, getApiKeys,
-  getActiveProject, getFileChanges, getMessages, getModels, getProviderInfos, getSession, getSettings,
-  getTodos, listProjects, listSessions, pendingPermissions, setApiKeyEnabled, setSettings,
-  setActiveProjectId, updateSession,
+  getActiveProject, getFileChanges, getMessages, getModels, getProviderInfos, getProject, getSession,
+  getSettings, getTodos, listProjects, listSessions, pendingPermissions, sessionOwner, setApiKeyEnabled,
+  setSettings, setActiveProjectId, updateSession,
 } from '../db/repo';
 import { abortRun, isRunning, runAgent } from '../agent/loop';
 import { recentEvents, subscribe } from '../agent/bus';
 import { settle } from '../agent/permissions';
 import { listDir, readFile, tree } from '../workspace/files';
-import { getProject } from '../db/repo';
-import { activeRoot, activeWorkspace, browse, openWorkspace, recentWorkspaces } from '../workspace/registry';
+import {
+  activeRoot, activeWorkspace, assertAllowedRoot, browse, openWorkspace, recentWorkspaces, safeRoot,
+} from '../workspace/registry';
 import { resolveAttachments } from '../workspace/attachments';
 import {
   installSkill, listSkills, removeSkill, setSkillEnabled, skillDirectories,
@@ -33,6 +35,10 @@ import {
   clearTerminalBuffer, createTerminal, disposeTerminal, getTerminal, interruptTerminal,
   listTerminals, subscribeTerminal, terminalBacklog, writeTerminal,
 } from '../terminal/manager';
+import type { Actor } from '../auth/service';
+import {
+  AuthError, authStatus, changePassword, currentUser, login, logout, register, verifySession,
+} from '../auth/service';
 
 class BadRequest extends Error {}
 
@@ -43,8 +49,33 @@ const MIME: Record<string, string> = {
   '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf',
 };
 
+/** Endpoints that must work before a session exists. Everything else needs one. */
+const PUBLIC_API = new Set([
+  '/api/health', '/api/auth/status', '/api/auth/login', '/api/auth/register',
+]);
+
+/** Query param / X-Agent-Token are kept for SSE and mobile WebViews. */
+function bearer(c: any): string {
+  return c.req.header('Authorization')?.replace(/^Bearer\s+/i, '')
+    || c.req.header('X-Agent-Token')
+    || c.req.query('token')
+    || '';
+}
+
+const actorOf = (c: any): Actor => c.get('actor') as Actor;
+
+function authFailure(c: any, err: unknown) {
+  if (err instanceof AuthError) return c.json({ error: err.message }, err.status);
+  return c.json({ error: (err as Error).message }, 400);
+}
+
+/** Hono context variables populated by the auth middleware. */
+interface AppVariables {
+  actor: Actor;
+}
+
 export function createApp() {
-  const app = new Hono();
+  const app = new Hono<{ Variables: AppVariables }>();
 
   app.use('*', cors({
     origin: '*',
@@ -52,12 +83,17 @@ export function createApp() {
     allowHeaders: ['Content-Type', 'Authorization', 'X-Agent-Token'],
   }));
 
-  // Shared secret. Query param is allowed so EventSource-style clients and
-  // mobile WebViews can authenticate without custom headers.
+  // A bearer token is now a per-account session, not the shared AGENT_TOKEN.
+  // AGENT_TOKEN is only the one-time setup secret for the first admin account.
   app.use('/api/*', async (c, next) => {
-    const header = c.req.header('Authorization')?.replace(/^Bearer\s+/i, '');
-    const supplied = header || c.req.header('X-Agent-Token') || c.req.query('token') || '';
-    if (supplied !== env.token) return c.json({ error: 'Unauthorized. Set the correct AGENT_TOKEN in Settings > Connection.' }, 401);
+    const actor = verifySession(bearer(c));
+    if (PUBLIC_API.has(c.req.path)) {
+      if (actor) c.set('actor', actor);
+      await next();
+      return;
+    }
+    if (!actor) return c.json({ error: 'Sign in to use CodingAgent. Each account uses its own API keys.' }, 401);
+    c.set('actor', actor);
     await next();
   });
 
@@ -69,20 +105,59 @@ export function createApp() {
     return result.data;
   };
 
+  /** Session ownership gate for routes keyed by a session id. */
+  const ownsSession = (c: any, sessionId: string, actor: Actor): boolean =>
+    !!sessionId && !!getSession(sessionId, actor.userId);
+
   // -----------------------------------------------------------------------
-  // Health
+  // Accounts / login / BYOK
+  // -----------------------------------------------------------------------
+  app.get('/api/auth/status', c => c.json(authStatus()));
+
+  app.post('/api/auth/register', async c => {
+    const body = await parse(c, RegisterSchema);
+    try {
+      const result: AuthResult = register(body);
+      return c.json(result, 201);
+    } catch (err) { return authFailure(c, err); }
+  });
+
+  app.post('/api/auth/login', async c => {
+    const body = await parse(c, LoginSchema);
+    try {
+      const result: AuthResult = login(body);
+      return c.json(result);
+    } catch (err) { return authFailure(c, err); }
+  });
+
+  app.post('/api/auth/logout', c => { logout(bearer(c)); return c.json({ ok: true }); });
+
+  app.get('/api/auth/me', c => c.json(currentUser(actorOf(c).userId)));
+
+  app.post('/api/auth/password', async c => {
+    const body = await parse(c, ChangePasswordSchema);
+    try { return c.json(changePassword(actorOf(c).userId, body.current, body.next)); }
+    catch (err) { return authFailure(c, err); }
+  });
+
+  // -----------------------------------------------------------------------
+  // Health — public but deliberately sparse until a session is attached
   // -----------------------------------------------------------------------
   app.get('/api/health', (c) => {
     const db = getDb();
     const models = (db.prepare('SELECT COUNT(*) AS n FROM models').get() as { n: number }).n;
-    const providers = getProviderInfos().filter(p => p.configured).length;
-    const project = getActiveProject();
+    const actor = c.get('actor') as Actor | undefined;
+    const project = actor ? getActiveProject(actor.userId) : null;
     const payload: HealthResponse = {
-      ok: true, name: 'CodingAgent', version: '0.1.0', dbPath: env.dbPath,
-      models, providersConfigured: providers,
-      workspaceRoot: activeRoot(),
+      ok: true, name: 'CodingAgent', version: '0.1.0',
+      dbPath: actor ? env.dbPath : '',
+      models,
+      providersConfigured: actor ? getProviderInfos(actor.userId).filter(p => p.configured).length : 0,
+      workspaceRoot: actor ? activeRoot(actor) : '',
       workspaceName: project?.name,
       projectId: project?.id,
+      authenticated: !!actor,
+      requiresAuth: true,
     };
     return c.json(payload);
   });
@@ -92,6 +167,7 @@ export function createApp() {
   // -----------------------------------------------------------------------
   app.get('/api/sessions/:id/events', async (c) => {
     const sessionId = c.req.param('id');
+    if (!ownsSession(c, sessionId, actorOf(c))) return c.json({ error: 'Session not found' }, 404);
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache, no-transform');
     c.header('Connection', 'keep-alive');
@@ -126,25 +202,32 @@ export function createApp() {
   // -----------------------------------------------------------------------
   // Projects & sessions
   // -----------------------------------------------------------------------
-  app.get('/api/projects', c => c.json(listProjects()));
+  app.get('/api/projects', c => c.json(listProjects(actorOf(c).userId)));
   app.post('/api/projects', async c => {
+    const actor = actorOf(c);
     const body = await c.req.json().catch(() => ({})) as { name?: string; rootPath?: string };
     if (!body.rootPath) return c.json({ error: 'rootPath is required' }, 400);
-    const project = createProject(body.name || path.basename(body.rootPath), body.rootPath);
+    // A project root becomes a file-tool sandbox root, so it must pass the
+    // same confinement check as opening a workspace.
+    let root: string;
+    try { root = assertAllowedRoot(actor, body.rootPath); }
+    catch (err) { return c.json({ error: (err as Error).message }, 403); }
+    const project = createProject(body.name || path.basename(root), root, actor.userId);
     // Creating a project is the same user intent as opening a workspace.
-    setActiveProjectId(project.id);
+    setActiveProjectId(project.id, actor.userId);
     return c.json(project, 201);
   });
 
-  app.get('/api/sessions', c => c.json(listSessions(c.req.query('projectId'))));
+  app.get('/api/sessions', c => c.json(listSessions(actorOf(c).userId, c.req.query('projectId'))));
   app.post('/api/sessions', async c => {
     const body = await parse(c, CreateSessionSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    return c.json(createSession(body), 201);
+    return c.json(createSession(actorOf(c).userId, body), 201);
   });
 
   app.get('/api/sessions/:id', c => {
-    const session = getSession(c.req.param('id'));
+    const actor = actorOf(c);
+    const session = getSession(c.req.param('id'), actor.userId);
     if (!session) return c.json({ error: 'Session not found' }, 404);
     return c.json({ session, messages: getMessages(session.id), todos: getTodos(session.id), running: isRunning(session.id) });
   });
@@ -152,100 +235,116 @@ export function createApp() {
   app.patch('/api/sessions/:id', async c => {
     const body = await parse(c, UpdateSessionSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    const updated = updateSession(c.req.param('id'), body);
+    const updated = updateSession(actorOf(c).userId, c.req.param('id'), body);
     return updated ? c.json(updated) : c.json({ error: 'Session not found' }, 404);
   });
 
   app.delete('/api/sessions/:id', c => {
-    abortRun(c.req.param('id'));
-    return c.json({ deleted: deleteSession(c.req.param('id')) });
+    const actor = actorOf(c);
+    const id = c.req.param('id');
+    if (!ownsSession(c, id, actor)) return c.json({ deleted: false });
+    abortRun(id);
+    return c.json({ deleted: deleteSession(id, actor.userId) });
   });
 
   app.post('/api/sessions/:id/chat', async c => {
+    const actor = actorOf(c);
     const sessionId = c.req.param('id');
-    if (!getSession(sessionId)) return c.json({ error: 'Session not found' }, 404);
+    if (!ownsSession(c, sessionId, actor)) return c.json({ error: 'Session not found' }, 404);
     if (isRunning(sessionId)) return c.json({ error: 'A response is already streaming for this session' }, 409);
     const body = await parse(c, ChatRequestSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    void runAgent({ sessionId, request: body });
+    void runAgent({ sessionId, request: body, actor });
     return c.json({ started: true, sessionId }, 202);
   });
 
-  app.post('/api/sessions/:id/abort', c => c.json({ aborted: abortRun(c.req.param('id')) }));
+  app.post('/api/sessions/:id/abort', c => {
+    const id = c.req.param('id');
+    if (!ownsSession(c, id, actorOf(c))) return c.json({ error: 'Session not found' }, 404);
+    return c.json({ aborted: abortRun(id) });
+  });
 
   // -----------------------------------------------------------------------
   // Permissions
   // -----------------------------------------------------------------------
-  app.get('/api/sessions/:id/permissions', c => c.json(pendingPermissions(c.req.param('id'))));
+  app.get('/api/sessions/:id/permissions', c => {
+    const id = c.req.param('id');
+    if (!ownsSession(c, id, actorOf(c))) return c.json({ error: 'Session not found' }, 404);
+    return c.json(pendingPermissions(id));
+  });
   app.post('/api/permissions/:id/resolve', async c => {
     const body = await parse(c, PermissionResolveSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    const updated = settle(c.req.param('id'), body.decision);
+    const updated = settle(c.req.param('id'), body.decision, actorOf(c).userId);
     return updated ? c.json(updated) : c.json({ error: 'Permission request not found or already resolved' }, 404);
   });
 
   // -----------------------------------------------------------------------
-  // Model catalog / providers / keys (reused DB tables)
+  // Model catalog / providers / keys — every key query is account-scoped
   // -----------------------------------------------------------------------
-  app.get('/api/models', c => c.json(getModels()));
-  app.get('/api/providers', c => c.json(getProviderInfos()));
-  app.get('/api/keys', c => c.json(getApiKeys()));
+  app.get('/api/models', c => c.json(getModels(actorOf(c).userId)));
+  app.get('/api/providers', c => c.json(getProviderInfos(actorOf(c).userId)));
+  app.get('/api/keys', c => c.json(getApiKeys(actorOf(c).userId)));
   app.post('/api/keys', async c => {
     const body = await parse(c, CreateKeySchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    try { return c.json(addApiKey(body), 201); }
+    try { return c.json(addApiKey(actorOf(c).userId, body), 201); }
     catch (err) { return c.json({ error: (err as Error).message }, 400); }
   });
   app.patch('/api/keys/:id', async c => {
+    const actor = actorOf(c);
     const body = await c.req.json().catch(() => ({})) as { enabled?: boolean };
     if (typeof body.enabled !== 'boolean') return c.json({ error: 'enabled must be a boolean' }, 400);
-    setApiKeyEnabled(Number(c.req.param('id')), body.enabled);
-    return c.json(getApiKeys());
+    setApiKeyEnabled(actor.userId, Number(c.req.param('id')), body.enabled);
+    return c.json(getApiKeys(actor.userId));
   });
-  app.delete('/api/keys/:id', c => c.json({ deleted: deleteApiKey(Number(c.req.param('id'))) }));
+  app.delete('/api/keys/:id', c => c.json({ deleted: deleteApiKey(actorOf(c).userId, Number(c.req.param('id'))) }));
 
   // -----------------------------------------------------------------------
   // Settings / telemetry
   // -----------------------------------------------------------------------
-  app.get('/api/settings', c => c.json(getSettings()));
+  app.get('/api/settings', c => c.json(getSettings(actorOf(c).userId)));
   app.patch('/api/settings', async c => {
     const body = await parse(c, SettingsSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    return c.json(setSettings(body));
+    return c.json(setSettings(actorOf(c).userId, body));
   });
-  app.get('/api/analytics', c => c.json(getAnalytics()));
+  app.get('/api/analytics', c => c.json(getAnalytics(actorOf(c).userId)));
 
   // -----------------------------------------------------------------------
   // Workspace: the sandboxed project home the agent is bound to
   // -----------------------------------------------------------------------
-  const rootFor = (c: any): string => {
+  const rootFor = (c: any, actor: Actor): string => {
     const projectId = c.req.query('projectId');
     if (projectId) {
-      const project = getProject(projectId);
-      if (project?.rootPath) return project.rootPath;
+      const project = getProject(projectId, actor.userId);
+      // Re-clamp even a user-owned row: file tools must never inherit a root
+      // that points (or symlinks) outside a confined account's sandbox.
+      if (project?.rootPath) return safeRoot(actor, project.rootPath);
     }
-    return activeRoot();
+    return activeRoot(actor);
   };
 
-  const rootForSession = (sessionId?: string): string => {
-    if (!sessionId) return activeRoot();
-    const session = getSession(sessionId);
-    const project = session ? getProject(session.projectId) : null;
-    return project?.rootPath?.trim() ? project.rootPath : activeRoot();
+  const rootForSession = (sessionId: string | undefined, actor: Actor): string => {
+    if (!sessionId) return activeRoot(actor);
+    const session = getSession(sessionId, actor.userId);
+    const project = session ? getProject(session.projectId, actor.userId) : null;
+    return project?.rootPath?.trim() ? safeRoot(actor, project.rootPath) : activeRoot(actor);
   };
 
   app.get('/api/workspace', (c) => {
+    const actor = actorOf(c);
     const payload: WorkspaceState = {
-      active: activeWorkspace(),
-      recent: recentWorkspaces(),
-      defaultRoot: env.workspaceRoot,
+      active: activeWorkspace(actor),
+      recent: recentWorkspaces(actor),
+      defaultRoot: actor.isAdmin ? env.workspaceRoot : actor.homeRoot,
     };
     return c.json(payload);
   });
 
   app.get('/api/workspace/browse', (c) => {
     try {
-      const result: BrowseResult = browse(c.req.query('path'));
+      const result: BrowseResult = browse(c.req.query('path'), actorOf(c));
       return c.json(result);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
@@ -256,7 +355,7 @@ export function createApp() {
     const body = await parse(c, OpenWorkspaceSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
     try {
-      const info: WorkspaceInfo = openWorkspace(body.path, body.name);
+      const info: WorkspaceInfo = openWorkspace(body.path, body.name, actorOf(c));
       return c.json(info);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
@@ -267,10 +366,14 @@ export function createApp() {
   // Attachments: explicit context pinned to a single turn
   // -----------------------------------------------------------------------
   app.post('/api/attachments/resolve', async (c) => {
+    const actor = actorOf(c);
     const body = await parse(c, ResolveAttachmentsSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    const root = rootForSession(body.sessionId);
-    const result: ResolveAttachmentsResult = resolveAttachments(root, body.paths);
+    if (body.sessionId && !ownsSession(c, body.sessionId, actor)) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+    const root = rootForSession(body.sessionId, actor);
+    const result: ResolveAttachmentsResult = resolveAttachments(root, body.paths, actor);
     return c.json(result);
   });
 
@@ -288,12 +391,13 @@ export function createApp() {
     try { return decodeURIComponent(raw); } catch { return raw; }
   };
 
-  app.get('/api/skills', (c) => c.json(skillsPayload(rootForSession(c.req.query('sessionId')))));
+  app.get('/api/skills', (c) => c.json(skillsPayload(rootForSession(c.req.query('sessionId'), actorOf(c)))));
 
   app.post('/api/skills/install', async (c) => {
+    const actor = actorOf(c);
     const body = await parse(c, InstallSkillSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    const root = rootForSession(body.sessionId);
+    const root = rootForSession(body.sessionId, actor);
     try {
       const result: InstallSkillResult = await installSkill(root, body);
       return c.json(result, result.installed.length ? 201 : 200);
@@ -303,27 +407,33 @@ export function createApp() {
   });
 
   app.patch('/api/skills/:id', async (c) => {
+    const actor = actorOf(c);
     const body = await parse(c, ToggleSkillSchema);
     if (!body) return c.json({ error: 'Invalid body' }, 400);
-    const root = rootForSession(body.sessionId);
+    const root = rootForSession(body.sessionId, actor);
     const updated = setSkillEnabled(root, skillId(c), body.enabled);
     return updated ? c.json(skillsPayload(root)) : c.json({ error: 'Skill not found' }, 404);
   });
 
   app.delete('/api/skills/:id', (c) => {
-    const root = rootForSession(c.req.query('sessionId'));
+    const actor = actorOf(c);
+    const root = rootForSession(c.req.query('sessionId'), actor);
     const removed = removeSkill(root, skillId(c));
     return removed ? c.json(skillsPayload(root)) : c.json({ error: 'Skill not found' }, 404);
   });
 
   // -----------------------------------------------------------------------
-  // Terminal: a persistent shell in the workspace root
+  // Terminal: a persistent shell in the account's workspace root
   // -----------------------------------------------------------------------
-  app.get('/api/terminal', c => c.json(listTerminals()));
+  app.get('/api/terminal', c => c.json(listTerminals(actorOf(c).userId)));
 
   app.post('/api/terminal', (c) => {
+    const actor = actorOf(c);
+    if (!actor.allowShell) {
+      return c.json({ error: 'Shell access is disabled for this account. Ask the administrator to enable AGENT_ALLOW_USER_SHELL.' }, 403);
+    }
     try {
-      const state: TerminalState = createTerminal(activeRoot());
+      const state: TerminalState = createTerminal(activeRoot(actor), actor.userId);
       return c.json(state, 201);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
@@ -331,8 +441,9 @@ export function createApp() {
   });
 
   app.get('/api/terminal/:id/events', async (c) => {
+    const actor = actorOf(c);
     const id = c.req.param('id');
-    if (!getTerminal(id)) return c.json({ error: 'Terminal not found' }, 404);
+    if (!getTerminal(id, actor.userId)) return c.json({ error: 'Terminal not found' }, 404);
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache, no-transform');
     c.header('Connection', 'keep-alive');
@@ -345,8 +456,8 @@ export function createApp() {
         void stream.writeSSE({ data: JSON.stringify(chunk), event: 'chunk' }).catch(() => {});
       };
       // Replay the scrollback so a reconnecting UI is not left with a blank shell.
-      for (const chunk of terminalBacklog(id)) write(chunk);
-      const unsubscribe = subscribeTerminal(id, write);
+      for (const chunk of terminalBacklog(id, actor.userId)) write(chunk);
+      const unsubscribe = subscribeTerminal(id, write, actor.userId);
       if (!unsubscribe) { closed = true; return; }
       stream.onAbort(() => { closed = true; unsubscribe(); });
       await stream.writeSSE({ data: JSON.stringify({ terminalId: id }), event: 'ready' });
@@ -363,23 +474,25 @@ export function createApp() {
   app.post('/api/terminal/:id/input', async (c) => {
     const body = await c.req.json().catch(() => ({})) as { data?: string };
     if (typeof body.data !== 'string') return c.json({ error: 'data must be a string' }, 400);
-    return writeTerminal(c.req.param('id'), body.data)
+    return writeTerminal(c.req.param('id'), body.data, actorOf(c).userId)
       ? c.json({ ok: true })
       : c.json({ error: 'Terminal not found' }, 404);
   });
 
-  app.post('/api/terminal/:id/interrupt', c => c.json({ ok: interruptTerminal(c.req.param('id')) }));
-  app.post('/api/terminal/:id/clear', c => c.json({ ok: clearTerminalBuffer(c.req.param('id')) }));
-  app.delete('/api/terminal/:id', c => c.json({ deleted: disposeTerminal(c.req.param('id')) }));
+  app.post('/api/terminal/:id/interrupt', c => c.json({ ok: interruptTerminal(c.req.param('id'), actorOf(c).userId) }));
+  app.post('/api/terminal/:id/clear', c => c.json({ ok: clearTerminalBuffer(c.req.param('id'), actorOf(c).userId) }));
+  app.delete('/api/terminal/:id', c => c.json({ deleted: disposeTerminal(c.req.param('id'), actorOf(c).userId) }));
 
   // -----------------------------------------------------------------------
   // Workspace file browsing
   // -----------------------------------------------------------------------
   app.get('/api/files/tree', c => {
+    const actor = actorOf(c);
+    const root = rootFor(c, actor);
     try {
       const depth = Number.parseInt(c.req.query('depth') ?? '2', 10);
-      const entries = depth > 1 ? tree(rootFor(c), c.req.query('path') ?? '.', Math.min(depth, 5)) : listDir(rootFor(c), c.req.query('path') ?? '.');
-      return c.json({ entries, root: rootFor(c) });
+      const entries = depth > 1 ? tree(root, c.req.query('path') ?? '.', Math.min(depth, 5)) : listDir(root, c.req.query('path') ?? '.');
+      return c.json({ entries, root });
     } catch (err) { return c.json({ error: (err as Error).message }, 400); }
   });
 
@@ -387,12 +500,22 @@ export function createApp() {
     const rel = c.req.query('path');
     if (!rel) return c.json({ error: 'path is required' }, 400);
     try {
-      return c.json(readFile(rootFor(c), rel, 1, 4000));
+      return c.json(readFile(rootFor(c, actorOf(c)), rel, 1, 4000));
     } catch (err) { return c.json({ error: (err as Error).message }, 400); }
   });
 
-  app.get('/api/files/changes', c => c.json(getFileChanges(c.req.query('sessionId') ?? '')));
-  app.get('/api/todos', c => c.json(getTodos(c.req.query('sessionId') ?? '')));
+  app.get('/api/files/changes', c => {
+    const actor = actorOf(c);
+    const id = c.req.query('sessionId') ?? '';
+    if (!id || sessionOwner(id) !== actor.userId) return c.json([], 403);
+    return c.json(getFileChanges(id));
+  });
+  app.get('/api/todos', c => {
+    const actor = actorOf(c);
+    const id = c.req.query('sessionId') ?? '';
+    if (!id || sessionOwner(id) !== actor.userId) return c.json([], 403);
+    return c.json(getTodos(id));
+  });
 
   // -----------------------------------------------------------------------
   // Static UI (desktop / single-origin production build)
@@ -415,6 +538,7 @@ export function createApp() {
   app.notFound(c => c.json({ error: `Not found: ${c.req.path}` }, 404));
   app.onError((err, c) => {
     if (err instanceof BadRequest) return c.json({ error: err.message }, 400);
+    if (err instanceof AuthError) return c.json({ error: err.message }, err.status);
     console.error('[http]', err);
     return c.json({ error: (err as Error).message }, 500);
   });

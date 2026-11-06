@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import {
   ArrowLeft, Server, Database, KeyRound, SlidersHorizontal, BarChart3, Plus, Trash2,
-  ShieldCheck, Check, Loader2, RefreshCw, Info, Cpu, AlertTriangle,
+  ShieldCheck, Check, Loader2, RefreshCw, Info, Cpu, AlertTriangle, UserRound, LogOut, LockKeyhole,
 } from 'lucide-vue-next';
 import { PLATFORMS, type Platform } from '@codingagent/shared';
 import { useAppStore } from '../stores/app';
-import { connection } from '../api/client';
+import { auth, changePasswordRequest, connection } from '../api/client';
 
 const store = useAppStore();
 const router = useRouter();
+const route = useRoute();
 
-type Section = 'connection' | 'model' | 'providers' | 'analytics' | 'about';
-const section = ref<Section>('connection');
+type Section = 'account' | 'connection' | 'model' | 'providers' | 'analytics' | 'about';
+const section = ref<Section>('account');
 const sections = [
+  { value: 'account', label: 'Account', icon: UserRound },
   { value: 'connection', label: 'Connection', icon: Server },
   { value: 'model', label: 'Agent', icon: SlidersHorizontal },
   { value: 'providers', label: 'Providers & keys', icon: KeyRound },
@@ -23,7 +25,9 @@ const sections = [
 ] as const;
 
 const urlInput = ref(connection.url);
-const tokenInput = ref(connection.token);
+const passwordDraft = reactive({ current: '', next: '', confirm: '' });
+const passwordBusy = ref(false);
+const passwordMessage = ref<{ ok: boolean; text: string } | null>(null);
 const testing = ref(false);
 const testResult = ref<{ ok: boolean; message: string } | null>(null);
 
@@ -42,6 +46,7 @@ const modelsForPlatform = computed(() => store.models.filter(m => m.platform ===
 const groupedKeys = computed(() => store.keys);
 
 onMounted(() => {
+  if (route.query.section === 'providers') section.value = 'providers';
   Object.assign(draft, {
     defaultPlatform: store.settings.defaultPlatform ?? '',
     defaultModelId: store.settings.defaultModelId ?? '',
@@ -56,11 +61,29 @@ onMounted(() => {
 async function testConnection() {
   testing.value = true;
   testResult.value = null;
-  const ok = await store.applyConnection(urlInput.value, tokenInput.value);
+  const ok = await store.applyConnection(urlInput.value);
   testResult.value = ok
-    ? { ok: true, message: `Connected · ${connection.health?.models ?? 0} models · ${connection.health?.providersConfigured ?? 0} providers` }
+    ? { ok: true, message: `Connected · ${connection.health?.models ?? 0} models. Sign in again to use this server.` }
     : { ok: false, message: connection.error || 'Could not reach the server' };
   testing.value = false;
+}
+
+async function changePassword() {
+  passwordMessage.value = null;
+  if (passwordDraft.next.length < 8) { passwordMessage.value = { ok: false, text: 'Use at least 8 characters.' }; return; }
+  if (passwordDraft.next !== passwordDraft.confirm) { passwordMessage.value = { ok: false, text: 'New passwords do not match.' }; return; }
+  passwordBusy.value = true;
+  try {
+    await changePasswordRequest(passwordDraft.current, passwordDraft.next);
+    passwordDraft.current = ''; passwordDraft.next = ''; passwordDraft.confirm = '';
+    passwordMessage.value = { ok: true, text: 'Password changed. All sessions were signed out — please sign in again.' };
+  } catch (err) { passwordMessage.value = { ok: false, text: (err as Error).message }; }
+  finally { passwordBusy.value = false; }
+}
+
+async function signOut() {
+  await store.signOut();
+  router.push('/');
 }
 
 async function save() {
@@ -120,25 +143,73 @@ function selectSection(value: Section) {
       <div class="flex-1 overflow-y-auto p-4 sm:p-6">
         <div class="max-w-2xl mx-auto space-y-5">
 
+          <!-- Account -->
+          <template v-if="section === 'account'">
+            <div><h2 class="text-[15px] font-semibold">Account</h2><p class="text-[12px] text-[var(--muted)] mt-0.5">Your identity, keys and session on this server.</p></div>
+            <div class="surface rounded-xl p-4 space-y-3">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-[var(--accent-soft)] text-[var(--accent-text)] grid place-items-center text-[15px] font-semibold uppercase shrink-0">
+                  {{ (auth.user?.name || auth.user?.email || '?').slice(0, 1) }}
+                </div>
+                <div class="min-w-0">
+                  <div class="text-[13px] font-medium truncate">{{ auth.user?.name || 'Unnamed account' }}</div>
+                  <div class="text-[11.5px] text-[var(--muted)] truncate">{{ auth.user?.email }}</div>
+                </div>
+                <span class="ml-auto text-[10px] px-2 py-1 rounded-md border hairline shrink-0"
+                  :class="auth.user?.isAdmin ? 'text-[var(--accent-text)]' : 'text-[var(--muted)]'">
+                  {{ auth.user?.isAdmin ? 'Administrator' : 'Member' }}
+                </span>
+              </div>
+              <div class="grid grid-cols-2 gap-2 border-t hairline pt-3">
+                <div class="rounded-lg bg-[var(--surface-2)] p-3">
+                  <div class="text-[10.5px] text-[var(--muted)]">Provider keys (yours only)</div>
+                  <div class="text-[18px] font-semibold mt-0.5" :class="auth.user?.keyCount ? 'text-[var(--green)]' : 'text-[var(--amber)]'">{{ auth.user?.keyCount ?? 0 }}</div>
+                </div>
+                <div class="rounded-lg bg-[var(--surface-2)] p-3">
+                  <div class="text-[10.5px] text-[var(--muted)]">Registration</div>
+                  <div class="text-[12px] font-medium mt-1.5">{{ auth.status?.registrationOpen ? 'Open' : 'Closed' }}</div>
+                </div>
+              </div>
+              <div class="flex items-start gap-2 text-[11px] leading-relaxed text-[var(--muted)] bg-[var(--green-soft)] text-[var(--green)] rounded-lg px-3 py-2">
+                <ShieldCheck :size="14" class="shrink-0 mt-0.5" />
+                <span>Keys, sessions, settings, workspaces and usage are isolated per account. Other registered users cannot see or spend your keys — they must add their own.</span>
+              </div>
+              <button class="w-full flex items-center justify-center gap-2 rounded-lg border hairline px-3 py-2 text-[12px] font-medium hover-soft" @click="signOut">
+                <LogOut :size="13" /> Sign out
+              </button>
+            </div>
+
+            <div class="surface rounded-xl p-4">
+              <h3 class="text-[12.5px] font-semibold mb-3 flex items-center gap-1.5"><LockKeyhole :size="14" /> Change password</h3>
+              <div class="grid gap-3 sm:grid-cols-3">
+                <label class="block"><span class="text-[11px] font-medium text-[var(--muted)]">Current</span>
+                  <input v-model="passwordDraft.current" type="password" autocomplete="current-password" class="mt-1 w-full rounded-lg border hairline bg-[var(--surface-2)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)]" /></label>
+                <label class="block"><span class="text-[11px] font-medium text-[var(--muted)]">New</span>
+                  <input v-model="passwordDraft.next" type="password" autocomplete="new-password" class="mt-1 w-full rounded-lg border hairline bg-[var(--surface-2)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)]" /></label>
+                <label class="block"><span class="text-[11px] font-medium text-[var(--muted)]">Confirm</span>
+                  <input v-model="passwordDraft.confirm" type="password" autocomplete="new-password" class="mt-1 w-full rounded-lg border hairline bg-[var(--surface-2)] px-3 py-2 text-[12px] outline-none focus:border-[var(--accent)]" /></label>
+              </div>
+              <div v-if="passwordMessage" class="mt-2 text-[11.5px] rounded-lg px-3 py-2"
+                :class="passwordMessage.ok ? 'bg-[var(--green-soft)] text-[var(--green)]' : 'bg-[var(--red-soft)] text-[var(--red)]'">{{ passwordMessage.text }}</div>
+              <button class="mt-3 rounded-lg bg-[var(--accent)] text-white px-3.5 py-2 text-[12px] font-medium disabled:opacity-60" :disabled="passwordBusy" @click="changePassword">
+                <Loader2 v-if="passwordBusy" :size="13" class="inline animate-spin" /> {{ passwordBusy ? 'Saving…' : 'Update password' }}
+              </button>
+              <p class="mt-2 text-[10.5px] text-[var(--faint)]">Changing your password signs out every device. You will need to sign in again.</p>
+            </div>
+          </template>
+
           <!-- Connection -->
-          <template v-if="section === 'connection'">
+          <template v-else-if="section === 'connection'">
             <div>
               <h2 class="text-[15px] font-semibold">Connection</h2>
               <p class="text-[12px] text-[var(--muted)] mt-0.5">Desktop starts the agent server automatically. Mobile connects to a server on your machine or LAN.</p>
             </div>
             <div class="surface rounded-xl p-4 space-y-4">
-              <div class="grid gap-3 sm:grid-cols-2">
-                <label class="block sm:col-span-2">
-                  <span class="text-[11px] font-medium text-[var(--muted)]">Server URL</span>
-                  <input v-model="urlInput" placeholder="http://192.168.1.50:4317 (empty = same origin)"
-                    class="mt-1 w-full rounded-lg border hairline bg-[var(--surface-2)] px-3 py-2 text-[12px] font-mono outline-none focus:border-[var(--accent)]" />
-                </label>
-                <label class="block sm:col-span-2">
-                  <span class="text-[11px] font-medium text-[var(--muted)]">Access token</span>
-                  <input v-model="tokenInput" type="password" placeholder="AGENT_TOKEN"
-                    class="mt-1 w-full rounded-lg border hairline bg-[var(--surface-2)] px-3 py-2 text-[12px] font-mono outline-none focus:border-[var(--accent)]" />
-                </label>
-              </div>
+              <label class="block">
+                <span class="text-[11px] font-medium text-[var(--muted)]">Server URL</span>
+                <input v-model="urlInput" placeholder="http://192.168.1.50:4317 (empty = same origin)"
+                  class="mt-1 w-full rounded-lg border hairline bg-[var(--surface-2)] px-3 py-2 text-[12px] font-mono outline-none focus:border-[var(--accent)]" />
+              </label>
               <div class="flex items-center gap-2 flex-wrap">
                 <button class="flex items-center gap-1.5 rounded-lg bg-[var(--accent)] text-white px-3.5 py-2 text-[12px] font-medium disabled:opacity-60" :disabled="testing" @click="testConnection">
                   <Loader2 v-if="testing" :size="13" class="animate-spin" /><Check v-else :size="13" /> Save & test
@@ -154,6 +225,11 @@ function selectSection(value: Section) {
               <div class="text-[11px] text-[var(--muted)] border-t hairline pt-3 space-y-1">
                 <div>Mode: <code class="font-mono">{{ connection.mode }}</code></div>
                 <div>Workspace: <code class="font-mono break-all">{{ connection.health?.workspaceRoot ?? '—' }}</code></div>
+                <div>Signed in as: <code class="font-mono">{{ auth.user?.email ?? '—' }}</code></div>
+              </div>
+              <div class="flex items-start gap-2 text-[11px] leading-relaxed rounded-lg bg-[var(--amber-soft)] text-[var(--amber)] px-3 py-2">
+                <AlertTriangle :size="13" class="shrink-0 mt-0.5" />
+                <span>There is no shared access token anymore. Each account signs in with its own email and password, and the session token is stored only in this browser. Changing the server URL signs you out.</span>
               </div>
             </div>
           </template>
@@ -217,7 +293,18 @@ function selectSection(value: Section) {
 
           <!-- Providers -->
           <template v-else-if="section === 'providers'">
-            <div><h2 class="text-[15px] font-semibold">Providers & API keys</h2><p class="text-[12px] text-[var(--muted)] mt-0.5">16 encrypted keys and {{ store.models.length }} models were carried over from the reused SQLite database.</p></div>
+            <div>
+              <h2 class="text-[15px] font-semibold">Providers & API keys</h2>
+              <p class="text-[12px] text-[var(--muted)] mt-0.5">These {{ store.keys.length }} encrypted key{{ store.keys.length === 1 ? '' : 's' }} belong only to <strong>{{ auth.user?.email }}</strong>. Other accounts cannot see or use them.</p>
+            </div>
+
+            <div v-if="!store.keys.length" class="flex items-start gap-2.5 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)] p-3.5 text-[11.5px] leading-relaxed text-[var(--amber)]">
+              <KeyRound :size="16" class="shrink-0 mt-0.5" />
+              <div>
+                <div class="font-semibold mb-0.5">Bring your own key to start chatting</div>
+                New accounts intentionally start with zero keys so nobody can spend the owner's quota. Add a provider key below — it is encrypted with AES-256-GCM and scoped to your account. A default model is selected automatically from your first key.
+              </div>
+            </div>
 
             <div class="surface rounded-xl divide-y hairline">
               <div v-for="key in groupedKeys" :key="key.id" class="flex items-center gap-3 px-3.5 py-2.5">
@@ -235,7 +322,7 @@ function selectSection(value: Section) {
                 </button>
                 <button class="p-1.5 rounded hover:bg-[var(--red-soft)] text-[var(--red)]" title="Remove" @click="store.removeKey(key.id)"><Trash2 :size="13" /></button>
               </div>
-              <div v-if="!groupedKeys.length" class="p-5 text-center text-[12px] text-[var(--muted)]">No keys stored.</div>
+              <div v-if="!groupedKeys.length" class="p-5 text-center text-[12px] text-[var(--muted)]">No keys on this account yet. Add your own below.</div>
             </div>
 
             <div class="surface rounded-xl p-4">
@@ -313,6 +400,9 @@ function selectSection(value: Section) {
                 <div><strong>SQLite database</strong><div class="text-[var(--muted)] break-all font-mono text-[11px]">{{ connection.health?.dbPath }}</div>
                   <p class="text-[var(--muted)] mt-1">Copied and renamed from <code class="font-mono">freellmapi_bak/server/data/freeapi.db</code>. Original tables are kept and reused: <code class="font-mono">models</code>, <code class="font-mono">api_keys</code>, <code class="font-mono">settings</code>, <code class="font-mono">fallback_config</code>, <code class="font-mono">requests</code>, <code class="font-mono">embedding_models</code>. New agent tables are prefixed <code class="font-mono">agent_</code>.</p>
                 </div>
+              </div>
+              <div class="border-t hairline pt-3 text-[var(--muted)]">
+                <strong class="text-[var(--text)]">Accounts &amp; BYOK</strong> — scrypt password hashes, random 32-byte bearer tokens stored only as SHA-256 hashes, and per-account rows in <code class="font-mono">api_keys</code>, <code class="font-mono">projects</code>, <code class="font-mono">agent_sessions</code>, <code class="font-mono">agent_user_settings</code> and <code class="font-mono">requests</code>. Non-admin accounts are confined to their own workspace folder and have shell access disabled by default.
               </div>
               <div class="border-t hairline pt-3 text-[var(--muted)]">
                 <strong class="text-[var(--text)]">Stack</strong> — Node.js 22 + TypeScript (Hono, Vercel AI SDK, better-sqlite3), Vue 3 + Vite + Pinia + Tailwind, Tauri 2 (Rust) for Windows/macOS/Linux desktop and Android/iOS.

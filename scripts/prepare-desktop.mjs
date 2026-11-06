@@ -8,10 +8,10 @@
  *     server/index.js                single-file esbuild bundle (all JS deps inlined)
  *     server/package.json            {"type":"module"} for the ESM bundle
  *     server/server-runtime.json     marker: env.projectRoot() resolves to this dir
- *     server/.env                    inherited ENCRYPTION_KEY + AGENT_TOKEN
+ *     server/.env                    fresh per-install secrets (see below)
  *     server/node_modules/           only better-sqlite3 + its native loader
  *     server/apps/web/dist/          UI served by the Node server (browser mode)
- *     server/data/codingagent.db     clean snapshot of the reused SQLite DB
+ *     server/data/codingagent.db     sanitized snapshot of the reused SQLite DB
  *     server/workspace/              seed workspace (Rust copies it to app data)
  *     manifest.json
  *
@@ -22,12 +22,23 @@
  * The Rust side injects DB_PATH / WORKSPACE_ROOT / PORT / HOST / AGENT_TOKEN as
  * real environment variables, which dotenv will not override.
  *
+ * PRIVACY: the source database is the developer's LIVE database. It contains
+ * chat history, usage telemetry, absolute project paths, the inherited
+ * FreeLLMAPI dashboard user's password hash + session tokens, and even a
+ * plaintext unified_api_key. Shipping that file in an installer would leak all
+ * of it, and shipping encrypted provider keys next to their ENCRYPTION_KEY is
+ * equivalent to shipping them in plaintext. The snapshot is therefore stripped
+ * down to the model catalogue + harmless preference defaults, and both secrets
+ * in server/.env are freshly generated. Pass --include-keys for a PRIVATE build
+ * that keeps your own encrypted keys (and the source ENCRYPTION_KEY they need).
+ *
  * Set CODINGAGENT_RESOURCES to write the assembled runtime elsewhere (used by
  * verification / CI without touching the Tauri project).
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -43,7 +54,57 @@ const OUT = process.env.CODINGAGENT_RESOURCES
 const RUNTIME = path.join(OUT, 'server');
 const requireFromRoot = createRequire(path.join(ROOT, 'package.json'));
 
+// ---------------------------------------------------------------------------
+// Native ABI preflight. `better-sqlite3` is a native addon: if npm launched us
+// with a Node whose NODE_MODULE_VERSION differs from the addon, we must NOT
+// silently fall back to a plain file copy (we cannot sanitize or VACUUM it)
+// and we must NOT bundle that incompatible node.exe. Re-exec under a Node that
+// can actually load the addon, so `npm run desktop:build` works from any shell.
+// ---------------------------------------------------------------------------
+function addonLoads() {
+  try {
+    const Database = requireFromRoot('better-sqlite3');
+    const probe = new Database(':memory:');
+    probe.close();
+    return true;
+  } catch { return false; }
+}
+
+if (!addonLoads() && !process.env.CODINGAGENT_DESKTOP_REEXEC) {
+  const candidates = [
+    process.env.CA_NODE_BIN,
+    path.join(process.env.ProgramFiles ?? 'C:\\Program Files', 'nodejs', 'node.exe'),
+    path.join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'nodejs', 'node.exe'),
+    '/usr/bin/node', '/usr/local/bin/node',
+  ].filter(Boolean);
+  const probe = "const D=require('better-sqlite3');const d=new D(':memory:');d.close();";
+  let compatible = '';
+  for (const bin of candidates) {
+    if (path.resolve(bin) === path.resolve(process.execPath)) continue;
+    try {
+      execFileSync(bin, ['-e', probe], { cwd: ROOT, stdio: 'ignore', timeout: 15_000 });
+      compatible = bin;
+      break;
+    } catch { /* wrong ABI or not installed */ }
+  }
+  if (!compatible) {
+    throw new Error(
+      `${process.version} cannot load better-sqlite3 and no compatible Node was found. ` +
+      'Run `npm rebuild better-sqlite3 --foreground-scripts`, or set CA_NODE_BIN to a matching Node binary.',
+    );
+  }
+  console.log(`[prepare-desktop] ${process.version} cannot load better-sqlite3; re-execing with ${compatible}`);
+  const result = spawnSync(compatible, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    cwd: ROOT,
+    stdio: 'inherit',
+    env: { ...process.env, CODINGAGENT_DESKTOP_REEXEC: '1' },
+  });
+  process.exit(result.status ?? 1);
+}
+
 const noBuild = process.argv.includes('--no-build');
+/** Opt-in for a private, never-redistributed installer that keeps your keys. */
+const includeKeys = process.argv.includes('--include-keys');
 const log = (...args) => console.log('[prepare-desktop]', ...args);
 
 function run(cmd, args, cwd = ROOT) {
@@ -117,6 +178,44 @@ for (const dir of [RUNTIME, path.join(OUT, 'node'), path.join(RUNTIME, 'apps', '
 //    inlined by esbuild. This is a separate build from apps/server's normal
 //    dist/index.js (which keeps packages external for `npm start` / tsx).
 // ---------------------------------------------------------------------------
+/**
+ * Never copy the source .env verbatim: it holds the ENCRYPTION_KEY that
+ * protects the developer's real database, plus their AGENT_TOKEN. Both are
+ * regenerated for every build. Only harmless, non-secret tunables are carried
+ * over, so a redistributed installer contains no reusable secret.
+ */
+function writePackagedEnv() {
+  const source = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
+  const values = new Map();
+  for (const line of source.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx > 0) values.set(trimmed.slice(0, idx).trim(), trimmed.slice(idx + 1).trim().replace(/^["']|["']$/g, ''));
+  }
+  const sourceKey = values.get('ENCRYPTION_KEY') ?? '';
+  if (includeKeys && !/^[0-9a-fA-F]{64}$/.test(sourceKey)) {
+    throw new Error('--include-keys needs a valid 64-hex ENCRYPTION_KEY in .env to decrypt the shipped keys.');
+  }
+  const encryptionKey = includeKeys ? sourceKey : crypto.randomBytes(32).toString('hex');
+  const setupToken = crypto.randomBytes(24).toString('base64url');
+
+  const CARRY = [
+    'AGENT_MAX_STEPS', 'AGENT_PERMISSION_MODE', 'ALLOW_REGISTRATION',
+    'AGENT_SESSION_TTL_DAYS', 'AGENT_ALLOW_USER_SHELL', 'USER_WORKSPACES_ROOT',
+  ];
+  const lines = [
+    '# Generated by scripts/prepare-desktop.mjs - safe to bundle, no source secrets.',
+    '# ENCRYPTION_KEY is unique to this build; AGENT_TOKEN is only the first-admin setup secret.',
+    `ENCRYPTION_KEY=${encryptionKey}`,
+    `AGENT_TOKEN=${setupToken}`,
+    `CODINGAGENT_INCLUDE_KEYS=${includeKeys ? '1' : '0'}`,
+  ];
+  for (const key of CARRY) if (values.has(key)) lines.push(`${key}=${values.get(key)}`);
+  fs.writeFileSync(path.join(RUNTIME, '.env'), `${lines.join('\n')}\n`, 'utf8');
+  log(`packaged .env: fresh ${includeKeys ? 'setup token (source ENCRYPTION_KEY preserved)' : 'ENCRYPTION_KEY + setup token'}`);
+}
+
 const esbuild = requireFromRoot('esbuild');
 await esbuild.build({
   entryPoints: [path.join(SERVER, 'src', 'index.ts')],
@@ -146,9 +245,9 @@ fs.writeFileSync(
   JSON.stringify({ name: 'codingagent-server-runtime', version: '0.1.0', generatedAt: new Date().toISOString() }, null, 2),
   'utf8',
 );
-fs.copyFileSync(path.join(ROOT, '.env'), path.join(RUNTIME, '.env'));
+writePackagedEnv();
 fs.cpSync(WEB_DIST, path.join(RUNTIME, 'apps', 'web', 'dist'), { recursive: true });
-log('single-file server bundle, marker, .env and web dist copied');
+log('single-file server bundle, marker, fresh .env and web dist copied');
 
 // ---------------------------------------------------------------------------
 // 2. Native-only dependency closure
@@ -250,10 +349,78 @@ log(`copied ${found.size} native runtime packages (${[...found.values()].map(v =
 if (missing.size) log('note: unresolved optional packages (skipped):', [...missing].join(', '));
 
 // ---------------------------------------------------------------------------
-// 3. Clean SQLite snapshot (VACUUM INTO folds any WAL into the copy)
+// 3. Clean + SANITIZED SQLite snapshot (VACUUM INTO folds any WAL into the copy)
 //    VACUUM INTO refuses an existing target, so build into a temp name then
 //    replace atomically - this also works when an older runtime is reused.
 // ---------------------------------------------------------------------------
+
+/**
+ * Strip every trace of the developer's machine from the shipped DB. Note the
+ * final VACUUM: without it, deleted rows (chat text, e-mail addresses, the
+ * plaintext unified_api_key) would still sit in free pages of the file.
+ */
+function sanitizeSnapshot(dbFile) {
+  const Database = requireFromRoot('better-sqlite3');
+  const db = new Database(dbFile);
+  db.pragma('foreign_keys = OFF');
+  const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
+  const count = (t) => tables.has(t) ? db.prepare(`SELECT COUNT(*) AS n FROM "${t}"`).get().n : 0;
+  const clear = (t) => { if (tables.has(t)) db.prepare(`DELETE FROM "${t}"`).run(); };
+  const before = {
+    agent_sessions: count('agent_sessions'), agent_messages: count('agent_messages'),
+    agent_parts: count('agent_parts'), requests: count('requests'),
+    projects: count('projects'), users: count('users'), sessions: count('sessions'),
+    api_keys: count('api_keys'),
+  };
+
+  db.transaction(() => {
+    // Children first, so an FK-enabled snapshot still deletes cleanly.
+    for (const table of [
+      'agent_parts', 'agent_messages', 'agent_todos', 'agent_file_changes',
+      'agent_permission_grants', 'agent_permissions', 'agent_sessions',
+      'agent_user_sessions', 'agent_user_settings', 'agent_users',
+      'projects', 'requests', 'rate_limit_usage', 'rate_limit_cooldowns',
+      'sessions', 'users',
+    ]) clear(table);
+
+    if (!includeKeys) clear('api_keys');
+    else if (tables.has('api_keys')
+        && db.prepare('PRAGMA table_info(api_keys)').all().some(c => c.name === 'user_id')) {
+      // A private build's keys must be claimable by the *new* first admin,
+      // not left owned by a developer-machine account id that no longer exists.
+      db.prepare('UPDATE api_keys SET user_id=NULL').run();
+    }
+
+    if (tables.has('settings')) {
+      const del = db.prepare('DELETE FROM settings WHERE key=?');
+      for (const { key } of db.prepare('SELECT key FROM settings').all()) {
+        const k = String(key).toLowerCase();
+        const isSecret = /key|token|secret|password|credential|auth/.test(k);
+        const isStalePointer = k === 'agent:active_project';
+        // With no shipped keys, a default model for a keyless platform would
+        // leave the composer unusable until the user manually picks a model.
+        const isStaleDefault = !includeKeys
+          && (k === 'agent:default_platform' || k === 'agent:default_model_id');
+        if (isSecret || isStalePointer || isStaleDefault) del.run(key);
+      }
+    }
+    clear('sqlite_sequence');
+  })();
+  db.exec('VACUUM');
+  const summary = {
+    models: count('models'),
+    api_keys: count('api_keys'),
+    projects: count('projects'),
+    agent_sessions: count('agent_sessions'),
+    requests: count('requests'),
+    users: count('users'),
+    settings: count('settings'),
+    before,
+  };
+  db.close();
+  return summary;
+}
+
 const srcDb = path.join(ROOT, 'data', 'codingagent.db');
 const dstDb = path.join(RUNTIME, 'data', 'codingagent.db');
 const tmpDb = path.join(RUNTIME, 'data', 'codingagent.db.tmp');
@@ -262,16 +429,21 @@ try {
   try { fs.unlinkSync(tmpDb); } catch { /* no stale temp */ }
   const db = new Database(srcDb, { readonly: true });
   db.exec(`VACUUM INTO '${tmpDb.replace(/\\/g, '/').replace(/'/g, "''")}'`);
-  const models = db.prepare('SELECT COUNT(*) AS n FROM models').get().n;
-  const keys = db.prepare('SELECT COUNT(*) AS n FROM api_keys').get().n;
   db.close();
+  try { fs.unlinkSync(dstDb); } catch { /* no previous snapshot */ }
   fs.renameSync(tmpDb, dstDb);
-  log(`database snapshot: ${models} models, ${keys} encrypted keys`);
 } catch (err) {
   log('VACUUM unavailable, falling back to plain file copy:', err.message);
   fs.copyFileSync(srcDb, dstDb);
   try { fs.unlinkSync(tmpDb); } catch { /* ignore */ }
 }
+// Deliberately NOT in a try/catch: if sanitisation fails we must not ship.
+const snapshot = sanitizeSnapshot(dstDb);
+log(`database snapshot: ${snapshot.models} models, ${snapshot.api_keys} keys ` +
+    `(purged ${snapshot.before.agent_sessions} sessions / ${snapshot.before.agent_messages} messages, ` +
+    `${snapshot.before.requests} request logs, ${snapshot.before.projects} project paths, ` +
+    `${snapshot.before.users} legacy users, ${snapshot.before.api_keys - snapshot.api_keys} provider keys)`);
+if (!includeKeys) log('provider keys stripped - first admin must BYOK. Use --include-keys for a private build.');
 
 // ---------------------------------------------------------------------------
 // 4. Seed workspace + portable Node binary

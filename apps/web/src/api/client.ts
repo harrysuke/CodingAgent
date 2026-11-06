@@ -1,26 +1,63 @@
 import { reactive } from 'vue';
-import type { AgentEvent, HealthResponse, TerminalChunk } from '@codingagent/shared';
+import type {
+  AgentEvent, AuthResult, AuthStatus, AuthUser, HealthResponse, TerminalChunk,
+} from '@codingagent/shared';
 
 const LS_URL = 'codingagent.serverUrl';
+/** Per-account session token. NOT the old shared AGENT_TOKEN. */
 const LS_TOKEN = 'codingagent.token';
-
-export const DEFAULT_TOKEN = 'change-me-local-dev-token';
+const LEGACY_TOKEN = 'change-me-local-dev-token';
 
 export const connection = reactive({
   /** Empty string = same origin (Vite proxy in dev, Node-served UI on desktop web build). */
   url: localStorage.getItem(LS_URL) ?? '',
-  token: localStorage.getItem(LS_TOKEN) ?? DEFAULT_TOKEN,
+  token: localStorage.getItem(LS_TOKEN) ?? '',
+  /**
+   * Desktop-only hint: the Rust sidecar hands us its AGENT_TOKEN so the
+   * first-run setup form can prefill the one-time setup secret. It is never
+   * used as a bearer credential.
+   */
+  setupTokenHint: '',
   mode: 'browser' as 'browser' | 'tauri' | 'mobile',
   connected: false,
   health: null as HealthResponse | null,
   error: '' as string,
 });
 
-export function setConnection(url: string, token: string): void {
+/** Reactive authentication state, shared by the router guard and the UI. */
+export const auth = reactive({
+  user: null as AuthUser | null,
+  status: null as AuthStatus | null,
+  checked: false,
+  /** The server has no /api/auth/* routes: it is an older build. */
+  staleServer: false,
+  error: '',
+});
+
+/** Old builds stored the shared secret here; it can never be a session token. */
+if (connection.token === LEGACY_TOKEN) {
+  connection.token = '';
+  localStorage.removeItem(LS_TOKEN);
+}
+
+export function setServerUrl(url: string): void {
   connection.url = url.replace(/\/+$/, '');
-  connection.token = token;
   localStorage.setItem(LS_URL, connection.url);
-  localStorage.setItem(LS_TOKEN, connection.token);
+}
+
+export function setSessionToken(token: string): void {
+  connection.token = token;
+  localStorage.setItem(LS_TOKEN, token);
+}
+
+export function clearSessionToken(): void {
+  connection.token = '';
+  localStorage.removeItem(LS_TOKEN);
+}
+
+/** Kept for callers that still pass (url, token); the token argument is ignored. */
+export function setConnection(url: string, _token = ''): void {
+  setServerUrl(url);
 }
 
 function isTauri(): boolean {
@@ -29,8 +66,8 @@ function isTauri(): boolean {
 
 /**
  * On the Tauri desktop shell the Rust side starts the Node sidecar and hands
- * us its loopback URL + token. Mobile has no sidecar, so it keeps whatever
- * LAN/remote server the user configured in Settings > Connection.
+ * us its loopback URL + setup token. Mobile has no sidecar, so it keeps
+ * whatever LAN/remote server the user configured in Settings > Connection.
  */
 export async function initConnection(): Promise<void> {
   connection.mode = isTauri() ? (/Android|iPhone|iPad/i.test(navigator.userAgent) ? 'mobile' : 'tauri') : 'browser';
@@ -38,12 +75,8 @@ export async function initConnection(): Promise<void> {
   try {
     const { invoke } = await import('@tauri-apps/api/core');
     const cfg = await invoke<{ url?: string; token?: string } | null>('get_server_config');
-    if (cfg?.url) {
-      connection.url = String(cfg.url).replace(/\/+$/, '');
-      connection.token = cfg.token || connection.token;
-      localStorage.setItem(LS_URL, connection.url);
-      localStorage.setItem(LS_TOKEN, connection.token);
-    }
+    if (cfg?.url) setServerUrl(String(cfg.url));
+    if (cfg?.token) connection.setupTokenHint = String(cfg.token);
   } catch (err) {
     console.warn('[connection] Tauri server config unavailable, using saved settings:', err);
   }
@@ -51,9 +84,18 @@ export async function initConnection(): Promise<void> {
 
 function base(): string { return connection.url; }
 
+function handleUnauthorized(path: string): void {
+  // A wrong password on /api/auth/login is not an expired session.
+  if (path.startsWith('/api/auth/login') || path.startsWith('/api/auth/register')) return;
+  clearSessionToken();
+  auth.user = null;
+  auth.checked = true;
+  connection.error = 'Your session has expired. Sign in again.';
+}
+
 export async function apiFetch<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set('Authorization', `Bearer ${connection.token}`);
+  if (connection.token) headers.set('Authorization', `Bearer ${connection.token}`);
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   let res: Response;
   try {
@@ -66,11 +108,11 @@ export async function apiFetch<T = unknown>(path: string, init: RequestInit = {}
   if (!res.ok) {
     const body = await res.json().catch(() => ({})) as { error?: string };
     const message = body.error || `${res.status} ${res.statusText}`;
-    if (res.status === 401) connection.error = 'Unauthorized - check the token in Settings > Connection.';
+    if (res.status === 401) handleUnauthorized(path);
     throw new Error(message);
   }
   connection.connected = true;
-  connection.error = '';
+  if (connection.error === 'Your session has expired. Sign in again.') connection.error = '';
   return res.json() as Promise<T>;
 }
 
@@ -88,6 +130,100 @@ export async function checkHealth(): Promise<HealthResponse | null> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Accounts / login / BYOK
+// ---------------------------------------------------------------------------
+
+/** Public. A 404 means the running server predates accounts entirely. */
+export async function loadAuthStatus(): Promise<AuthStatus | null> {
+  try {
+    const res = await fetch(`${base()}/api/auth/status`);
+    if (res.status === 404) {
+      auth.staleServer = true;
+      auth.status = null;
+      return null;
+    }
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    auth.status = await res.json() as AuthStatus;
+    auth.staleServer = false;
+  } catch {
+    auth.status = null;
+  }
+  return auth.status;
+}
+
+/** Restore a saved session on page load, or decide that login is required. */
+export async function restoreSession(): Promise<void> {
+  auth.checked = false;
+  await loadAuthStatus();
+  if (auth.staleServer) {
+    auth.user = null;
+    auth.checked = true;
+    return;
+  }
+  if (!connection.token) {
+    auth.user = null;
+    auth.checked = true;
+    return;
+  }
+  try {
+    auth.user = await apiFetch<AuthUser | null>('/api/auth/me');
+    if (!auth.user) clearSessionToken();
+  } catch {
+    auth.user = null;
+    clearSessionToken();
+  }
+  auth.checked = true;
+}
+
+function applyAuthResult(result: AuthResult): void {
+  setSessionToken(result.token);
+  auth.user = result.user;
+  auth.checked = true;
+  auth.error = '';
+  connection.error = '';
+  void loadAuthStatus();
+}
+
+export async function signIn(email: string, password: string): Promise<void> {
+  applyAuthResult(await apiFetch<AuthResult>('/api/auth/login', {
+    method: 'POST', body: JSON.stringify({ email, password }),
+  }));
+}
+
+export async function signUp(input: {
+  email: string; password: string; name?: string; setupToken?: string;
+}): Promise<void> {
+  applyAuthResult(await apiFetch<AuthResult>('/api/auth/register', {
+    method: 'POST', body: JSON.stringify(input),
+  }));
+}
+
+export async function signOut(): Promise<void> {
+  try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch { /* offline is fine */ }
+  clearSessionToken();
+  auth.user = null;
+  auth.checked = true;
+  await loadAuthStatus();
+}
+
+/** Refresh keyCount after adding/removing a provider key. */
+export async function refreshMe(): Promise<void> {
+  if (!connection.token) return;
+  try { auth.user = await apiFetch<AuthUser | null>('/api/auth/me'); }
+  catch { /* a concurrent expiry is handled by apiFetch */ }
+}
+
+/** Changing a password invalidates every session, so the UI must re-login. */
+export async function changePasswordRequest(current: string, next: string): Promise<void> {
+  await apiFetch('/api/auth/password', {
+    method: 'POST', body: JSON.stringify({ current, next }),
+  });
+  clearSessionToken();
+  auth.user = null;
+  auth.checked = true;
+}
+
 /** fetch-based SSE so we can send the Authorization header (EventSource cannot). */
 async function streamFrames(
   url: string,
@@ -98,6 +234,7 @@ async function streamFrames(
     headers: { Authorization: `Bearer ${connection.token}`, Accept: 'text/event-stream' },
     signal,
   });
+  if (res.status === 401) handleUnauthorized('/api/sse');
   if (!res.ok || !res.body) throw new Error(`Event stream failed: ${res.status}`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

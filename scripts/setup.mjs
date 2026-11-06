@@ -61,9 +61,16 @@ if (!fs.existsSync(targetDb)) {
 
 if (!fs.existsSync(targetEnv)) {
   const key = readSourceKey() ?? crypto.randomBytes(32).toString('hex');
+  // AGENT_TOKEN is the one-time first-admin setup secret. Never ship the
+  // public placeholder into a real install: anyone on the LAN could otherwise
+  // register first and claim the owner's provider keys.
   const template = fs.readFileSync(path.join(root, '.env.example'), 'utf8');
-  fs.writeFileSync(targetEnv, template.replace('your-64-char-hex-key-here', key), 'utf8');
-  console.log(`[setup] Wrote .env (encryption key ${readSourceKey() ? 'inherited from source project' : 'newly generated'}).`);
+  const env = template
+    .replace('your-64-char-hex-key-here', key)
+    .replace('change-me-local-dev-token', crypto.randomBytes(24).toString('base64url'));
+  fs.writeFileSync(targetEnv, env, 'utf8');
+  console.log(`[setup] Wrote .env (encryption key ${readSourceKey() ? 'inherited from source project' : 'newly generated'}; fresh setup token).`);
+  console.log('[setup] Save the AGENT_TOKEN line — it is needed once to create your admin account.');
 } else {
   console.log('[setup] .env already exists - kept as is.');
 }

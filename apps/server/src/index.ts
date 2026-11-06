@@ -6,6 +6,7 @@ import { env } from './env';
 import { initDb, closeDb } from './db/client';
 import { createApp } from './http/app';
 import { disposeAllTerminals } from './terminal/manager';
+import { authStatus } from './auth/service';
 
 function freePort(start: number, host: string): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -31,6 +32,15 @@ async function main() {
   const portFile = path.join(path.dirname(env.dbPath), 'server.port');
   fs.mkdirSync(path.dirname(portFile), { recursive: true });
   fs.writeFileSync(portFile, String(port), 'utf8');
+
+  const status = authStatus();
+  if (status.needsSetup) {
+    console.warn('[CodingAgent] No accounts yet — open the app to create the first admin account.');
+    console.warn('[CodingAgent] The setup token is AGENT_TOKEN from .env (or <app-data>/server.env on desktop).');
+    if (status.setupTokenIsDefault) {
+      console.warn('[CodingAgent] WARNING: AGENT_TOKEN is still the shipped placeholder. Run `node scripts/rotate-setup-token.mjs` before exposing this server to a LAN.');
+    }
+  }
 
   if (port !== env.port) {
     console.warn(`[CodingAgent] port ${env.port} is already in use — listening on ${port} instead.`);

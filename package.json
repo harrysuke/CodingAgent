@@ -12,6 +12,7 @@
   ],
   "scripts": {
     "setup": "node scripts/setup.mjs",
+    "rotate:setup-token": "node scripts/rotate-setup-token.mjs",
     "build:shared": "npm run build -w @codingagent/shared",
     "dev": "npm run build:shared && concurrently --kill-others-on-fail --names server,web \"npm run dev -w @codingagent/server\" \"npm run dev -w @codingagent/web\"",
     "dev:server": "npm run build:shared && npm run dev -w @codingagent/server",
@@ -22,6 +23,7 @@
     "db:migrate": "npm run build:shared && npm run db:migrate -w @codingagent/server",
     "desktop:dev": "npm run build:shared && npm run desktop:dev -w @codingagent/desktop",
     "desktop:build": "node scripts/prepare-desktop.mjs && npm run desktop:build -w @codingagent/desktop",
+    "desktop:build:private": "node scripts/prepare-desktop.mjs --include-keys && npm run desktop:build -w @codingagent/desktop",
     "desktop:check": "cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml",
     "verify:desktop": "node scripts/verify-desktop-runtime.mjs",
     "mobile:android:init": "npm run mobile:android:init -w @codingagent/desktop",

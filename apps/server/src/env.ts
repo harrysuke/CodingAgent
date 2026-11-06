@@ -40,6 +40,23 @@ export const env = {
   maxSteps: int(process.env.AGENT_MAX_STEPS, 30),
   permissionMode: (process.env.AGENT_PERMISSION_MODE ?? 'ask') as 'ask' | 'allow' | 'deny',
   extraOrigins: (process.env.EXTRA_ORIGINS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+
+  // --- accounts / BYOK -----------------------------------------------------
+  /** AGENT_TOKEN is no longer an API credential: it is the one-time setup
+   *  secret for the first admin account and the desktop sidecar health probe. */
+  setupToken: process.env.AGENT_TOKEN ?? 'change-me-local-dev-token',
+  /** True when the owner never rotated the shipped placeholder. */
+  setupTokenIsDefault: !process.env.AGENT_TOKEN
+    || process.env.AGENT_TOKEN.trim() === 'change-me-local-dev-token',
+  allowRegistration: (process.env.ALLOW_REGISTRATION ?? 'true').toLowerCase() !== 'false',
+  sessionTtlDays: int(process.env.AGENT_SESSION_TTL_DAYS, 30),
+  /** Non-admin accounts are confined to their own folder under this root. */
+  userWorkspacesRoot: path.resolve(ROOT, process.env.USER_WORKSPACES_ROOT ?? './data/workspaces'),
+  /**
+   * A shell can `cd ..` out of any in-process sandbox. Disabled for regular
+   * accounts by default so they cannot reach the host .env / database.
+   */
+  allowUserShell: (process.env.AGENT_ALLOW_USER_SHELL ?? 'false').toLowerCase() === 'true',
 };
 
 export function assertEncryptionKey(): void {

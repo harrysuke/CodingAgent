@@ -7,6 +7,7 @@ const MUTATING = new Set(['bash', 'write', 'edit']);
 
 export interface PermissionContext {
   sessionId: string;
+  userId: string;
   toolCallId: string;
   toolName: string;
   input: unknown;
@@ -50,7 +51,7 @@ export async function checkPermission(
   if (mode === 'allow') return { allowed: true };
   if (hasGrant(ctx.sessionId, ctx.toolName)) return { allowed: true };
 
-  const permission = createPermission(ctx.sessionId, ctx.toolCallId, ctx.toolName, ctx.input);
+  const permission = createPermission(ctx.sessionId, ctx.toolCallId, ctx.toolName, ctx.input, ctx.userId);
   emit(ctx.sessionId, { type: 'permission', permission });
 
   try {
@@ -62,8 +63,8 @@ export async function checkPermission(
   }
 }
 
-export function settle(id: string, status: PermissionRequest['status']): PermissionRequest | null {
-  const updated = resolvePermission(id, status);
+export function settle(id: string, status: PermissionRequest['status'], userId?: string): PermissionRequest | null {
+  const updated = resolvePermission(id, status, userId);
   if (updated) {
     settlePermission(id, status);
     emit(updated.sessionId, { type: 'permission-resolved', permissionId: id, status });

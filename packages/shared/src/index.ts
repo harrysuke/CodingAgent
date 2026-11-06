@@ -324,6 +324,65 @@ export const DEFAULT_SETTINGS: AppSettings = {
 };
 
 // ---------------------------------------------------------------------------
+// Accounts, login and BYOK
+//
+// Every provider key belongs to exactly one account. A freshly registered
+// account owns zero keys, so it cannot spend anybody else's quota until it
+// adds its own key in Settings > Providers & keys.
+// ---------------------------------------------------------------------------
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string;
+  isAdmin: boolean;
+  /** Number of enabled, decryptable keys this account owns. */
+  keyCount: number;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export interface AuthStatus {
+  /** False until the first admin account has been created. */
+  needsSetup: boolean;
+  registrationOpen: boolean;
+  /** True when the server still allows non-admin shell access. */
+  userShellEnabled: boolean;
+  /**
+   * The one-time setup secret is still the shipped placeholder. Only surfaced
+   * while `needsSetup` is true, so it cannot help an attacker after setup.
+   */
+  setupTokenIsDefault: boolean;
+}
+
+export interface AuthResult {
+  token: string;
+  expiresAt: number;
+  user: AuthUser;
+}
+
+export const LoginSchema = z.object({
+  email: z.string().email('Enter a valid email address').max(254),
+  password: z.string().min(1, 'Password is required').max(200),
+});
+
+export const RegisterSchema = z.object({
+  email: z.string().email('Enter a valid email address').max(254),
+  password: z.string().min(8, 'Use at least 8 characters').max(200),
+  name: z.string().trim().max(80).optional(),
+  /**
+   * Required only for the very first account. Equals AGENT_TOKEN from .env,
+   * so a stranger who reaches a fresh server cannot claim the owner's keys.
+   */
+  setupToken: z.string().max(200).optional(),
+});
+
+export const ChangePasswordSchema = z.object({
+  current: z.string().min(1).max(200),
+  next: z.string().min(8, 'Use at least 8 characters').max(200),
+});
+
+// ---------------------------------------------------------------------------
 // Request DTOs
 // ---------------------------------------------------------------------------
 
@@ -419,6 +478,7 @@ export interface HealthResponse {
   ok: boolean;
   name: string;
   version: string;
+  /** Empty for unauthenticated callers so the local path is not disclosed. */
   dbPath: string;
   models: number;
   providersConfigured: number;
@@ -426,4 +486,7 @@ export interface HealthResponse {
   /** Display name of the workspace currently opened as the agent's home. */
   workspaceName?: string;
   projectId?: string;
+  /** Whether a logged-in account was attached to this request. */
+  authenticated?: boolean;
+  requiresAuth?: boolean;
 }

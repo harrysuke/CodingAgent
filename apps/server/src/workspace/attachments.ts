@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Attachment, AttachmentInput, ResolveAttachmentsResult } from '@codingagent/shared';
-import { expandHome, isBinary, isInside, isDirectory, resolveSafe } from './paths';
+import type { Actor } from '../auth/service';
+import { expandHome, isBinary, isInside, isInsideReal, isDirectory, resolveSafe } from './paths';
 
 /** Per-file cap. Large enough for a big source file, small enough to stay in context. */
 const MAX_ATTACHMENT_BYTES = 256 * 1024;
@@ -27,7 +28,7 @@ function humanSize(bytes: number): string {
  *  - `content`: the browser read a device file but cannot expose its real
  *    path, so the bytes arrive inline and are trusted as an explicit user pick.
  */
-export function resolveAttachment(root: string, input: AttachmentInput): Attachment {
+export function resolveAttachment(root: string, input: AttachmentInput, actor?: Actor): Attachment {
   const requested = (input.path ?? '').trim();
   if (!requested) throw new Error('Empty attachment path.');
 
@@ -53,8 +54,15 @@ export function resolveAttachment(root: string, input: AttachmentInput): Attachm
   const external = absolute ? !isInside(root, expanded) : false;
 
   // Workspace-relative paths go through the sandbox (symlinks included);
-  // absolute paths were chosen explicitly by the user in the picker.
+  // absolute paths were chosen explicitly by the user in the picker. A
+  // regular account may never reach outside its own workspace with either.
   const abs = absolute ? path.resolve(expanded) : resolveSafe(root, expanded);
+  // Textual + realpath containment: an absolute path may sit inside the
+  // sandbox but still be a symlink out to the host's .env / database.
+  if (actor && !actor.isAdmin && actor.homeRoot
+      && (!isInside(actor.homeRoot, abs) || !isInsideReal(actor.homeRoot, abs))) {
+    throw new Error('This account can only attach files from its own workspace.');
+  }
   if (!fs.existsSync(abs)) throw new Error(`File not found: ${requested}`);
   if (isDirectory(abs)) throw new Error(`That is a folder, not a file: ${requested}`);
 
@@ -78,14 +86,14 @@ export function resolveAttachment(root: string, input: AttachmentInput): Attachm
   };
 }
 
-export function resolveAttachments(root: string, inputs: AttachmentInput[] = []): ResolveAttachmentsResult {
+export function resolveAttachments(root: string, inputs: AttachmentInput[] = [], actor?: Actor): ResolveAttachmentsResult {
   const attachments: Attachment[] = [];
   const errors: Array<{ path: string; error: string }> = [];
   let budget = MAX_TOTAL_CHARS;
 
   for (const input of inputs) {
     try {
-      const attachment = resolveAttachment(root, input);
+      const attachment = resolveAttachment(root, input, actor);
       if (budget <= 0) {
         errors.push({ path: input.path, error: 'Skipped: the attachment budget for this turn is exhausted.' });
         continue;

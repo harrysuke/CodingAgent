@@ -17,6 +17,41 @@
  */
 export const AGENT_SCHEMA_SQL = `
 -- ---------------------------------------------------------------------------
+-- Accounts. Deliberately separate from the inherited FreeLLMAPI users /
+-- sessions dashboard tables: those carry old password hashes and session
+-- tokens we must never accept as CodingAgent credentials.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_users (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  name TEXT NOT NULL DEFAULT '',
+  password_hash TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_login_at TEXT
+);
+
+-- Only the SHA-256 hash of the bearer token is stored, so a database dump
+-- cannot be replayed as a live session.
+CREATE TABLE IF NOT EXISTS agent_user_sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES agent_users(id) ON DELETE CASCADE,
+  expires_at_ms INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_user_sessions_user ON agent_user_sessions(user_id);
+
+-- Per-account preferences + the active project pointer. Global settings
+-- rows are used only as defaults for keys an account has not set itself.
+CREATE TABLE IF NOT EXISTS agent_user_settings (
+  user_id TEXT NOT NULL REFERENCES agent_users(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (user_id, key)
+);
+
+-- ---------------------------------------------------------------------------
 -- Projects (workspace roots the agent may operate on)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS projects (
@@ -142,5 +177,17 @@ export function inheritedTableMigrations(db: import('better-sqlite3').Database):
   }
   if (!cols('models').has('supports_tools')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
+  }
+
+  // --- ownership columns -------------------------------------------------
+  // Nullable on purpose: rows created before accounts existed stay invisible
+  // until the first admin claims them. Every query filters on user_id, so a
+  // NULL row can never be used by a regular account.
+  const ownedTables = ['api_keys', 'projects', 'agent_sessions', 'agent_permissions', 'requests'];
+  for (const table of ownedTables) {
+    if (!cols(table).has('user_id')) {
+      db.prepare(`ALTER TABLE ${table} ADD COLUMN user_id TEXT`).run();
+    }
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_${table}_user ON ${table}(user_id)`).run();
   }
 }

@@ -43,12 +43,21 @@ export function nearestExisting(target: string): string {
   return current;
 }
 
-function realpathOrSelf(target: string): string {
+export function realpathOrSelf(target: string): string {
   try {
     return fs.realpathSync.native(target);
   } catch {
     return path.resolve(target);
   }
+}
+
+/**
+ * Containment check that also follows symlinks on the nearest existing
+ * ancestor. A textual `isInside` alone can be defeated by a directory
+ * symlink placed inside a confined workspace that points at C:\\ or ~/.ssh.
+ */
+export function isInsideReal(root: string, candidate: string): boolean {
+  return isInside(realpathOrSelf(root), realpathOrSelf(nearestExisting(candidate)));
 }
 
 /**

@@ -24,6 +24,9 @@ use std::{
 #[derive(Clone, Serialize)]
 pub struct ServerConfig {
     url: String,
+    /// AGENT_TOKEN from server.env. NOT a bearer credential: the web client
+    /// uses this only to prefill the one-time first-admin setup form. After
+    /// login every request carries that account's own session token.
     token: String,
 }
 

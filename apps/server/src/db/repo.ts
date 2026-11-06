@@ -26,19 +26,21 @@ const mapProject = (r: Row): Project => ({
   id: r.id, name: r.name, rootPath: r.root_path, createdAt: r.created_at, updatedAt: r.updated_at,
 });
 
-export function listProjects(): Project[] {
-  return (getDb().prepare('SELECT * FROM projects ORDER BY created_at').all() as Row[]).map(mapProject);
+// Every row that belongs to an account is filtered by user_id. There is no
+// "no user" fallback on purpose: a missing userId must never widen a query.
+export function listProjects(userId: string): Project[] {
+  return (getDb().prepare('SELECT * FROM projects WHERE user_id=? ORDER BY created_at').all(userId) as Row[]).map(mapProject);
 }
 
-export function getProject(id: string): Project | null {
-  const r = getDb().prepare('SELECT * FROM projects WHERE id=?').get(id) as Row | undefined;
+export function getProject(id: string, userId: string): Project | null {
+  const r = getDb().prepare('SELECT * FROM projects WHERE id=? AND user_id=?').get(id, userId) as Row | undefined;
   return r ? mapProject(r) : null;
 }
 
-export function createProject(name: string, rootPath: string): Project {
+export function createProject(name: string, rootPath: string, userId: string): Project {
   const id = randomUUID();
-  getDb().prepare('INSERT INTO projects (id, name, root_path) VALUES (?,?,?)').run(id, name, rootPath);
-  return getProject(id)!;
+  getDb().prepare('INSERT INTO projects (id, name, root_path, user_id) VALUES (?,?,?,?)').run(id, name, rootPath, userId);
+  return getProject(id, userId)!;
 }
 
 export function touchProject(id: string): void {
@@ -46,30 +48,32 @@ export function touchProject(id: string): void {
 }
 
 /** Case-insensitive on Windows/macOS: the same folder can arrive as C:\Foo or c:/foo. */
-export function findProjectByPath(rootPath: string): Project | null {
-  const rows = getDb().prepare('SELECT * FROM projects').all() as Row[];
+export function findProjectByPath(rootPath: string, userId: string): Project | null {
+  const rows = getDb().prepare('SELECT * FROM projects WHERE user_id=?').all(userId) as Row[];
   return rows.map(mapProject).find(p => samePath(p.rootPath, rootPath)) ?? null;
 }
 
 const ACTIVE_PROJECT_KEY = 'agent:active_project';
 
-export function getActiveProjectId(): string | null {
-  const row = getDb().prepare('SELECT value FROM settings WHERE key=?').get(ACTIVE_PROJECT_KEY) as Row | undefined;
+/** The active workspace pointer is per account, not a single global setting. */
+export function getActiveProjectId(userId: string): string | null {
+  const row = getDb().prepare('SELECT value FROM agent_user_settings WHERE user_id=? AND key=?')
+    .get(userId, ACTIVE_PROJECT_KEY) as Row | undefined;
   return row?.value || null;
 }
 
-export function setActiveProjectId(id: string): void {
+export function setActiveProjectId(id: string, userId: string): void {
   getDb()
-    .prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-    .run(ACTIVE_PROJECT_KEY, id);
+    .prepare('INSERT INTO agent_user_settings (user_id,key,value) VALUES (?,?,?) ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value')
+    .run(userId, ACTIVE_PROJECT_KEY, id);
 }
 
-/** The workspace the agent is currently bound to: active project, else the first one. */
-export function getActiveProject(): Project | null {
-  const id = getActiveProjectId();
-  const active = id ? getProject(id) : null;
+/** The workspace the agent is currently bound to for this account. */
+export function getActiveProject(userId: string): Project | null {
+  const id = getActiveProjectId(userId);
+  const active = id ? getProject(id, userId) : null;
   if (active) return active;
-  return listProjects()[0] ?? null;
+  return listProjects(userId)[0] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -88,43 +92,56 @@ const mapSession = (r: Row): Session => ({
   updatedAt: r.updated_at,
 });
 
-export function listSessions(projectId?: string): Session[] {
+export function listSessions(userId: string, projectId?: string): Session[] {
   const db = getDb();
   const rows = projectId
-    ? db.prepare('SELECT * FROM agent_sessions WHERE project_id=? ORDER BY updated_at DESC').all(projectId) as Row[]
-    : db.prepare('SELECT * FROM agent_sessions ORDER BY updated_at DESC').all() as Row[];
+    ? db.prepare('SELECT * FROM agent_sessions WHERE user_id=? AND project_id=? ORDER BY updated_at DESC').all(userId, projectId) as Row[]
+    : db.prepare('SELECT * FROM agent_sessions WHERE user_id=? ORDER BY updated_at DESC').all(userId) as Row[];
   return rows.map(mapSession);
 }
 
-export function getSession(id: string): Session | null {
-  const r = getDb().prepare('SELECT * FROM agent_sessions WHERE id=?').get(id) as Row | undefined;
+export function getSession(id: string, userId: string): Session | null {
+  const r = getDb().prepare('SELECT * FROM agent_sessions WHERE id=? AND user_id=?').get(id, userId) as Row | undefined;
   return r ? mapSession(r) : null;
 }
 
-export function createSession(input: { projectId?: string; title?: string; agent?: AgentMode } = {}): Session {
+/** Ownership lookup used by routes keyed by something other than a session id. */
+export function sessionOwner(sessionId: string): string | null {
+  const r = getDb().prepare('SELECT user_id FROM agent_sessions WHERE id=?').get(sessionId) as Row | undefined;
+  return r?.user_id ?? null;
+}
+
+export function createSession(
+  userId: string,
+  input: { projectId?: string; title?: string; agent?: AgentMode } = {},
+): Session {
   const db = getDb();
   // New sessions attach to the workspace that is currently open, so opening a
   // folder is what scopes the agent — not an implicit default directory.
-  const project = input.projectId ? getProject(input.projectId) : getActiveProject();
-  const projectId = project?.id ?? createProject('workspace', '').id;
-  const settings = getSettings();
+  const project = input.projectId ? getProject(input.projectId, userId) : getActiveProject(userId);
+  const projectId = project?.id ?? createProject('workspace', '', userId).id;
+  const settings = getSettings(userId);
   const id = randomUUID();
   db.prepare(`
-    INSERT INTO agent_sessions (id, project_id, title, model_platform, model_id, agent, status, history_json, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?)
+    INSERT INTO agent_sessions (id, project_id, title, model_platform, model_id, agent, status, history_json, user_id, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
   `).run(id, projectId, input.title ?? 'New session', settings.defaultPlatform, settings.defaultModelId,
-    input.agent ?? settings.agent, 'idle', '[]', now(), now());
-  return getSession(id)!;
+    input.agent ?? settings.agent, 'idle', '[]', userId, now(), now());
+  return getSession(id, userId)!;
 }
 
-export function updateSession(id: string, patch: Partial<Pick<Session, 'title' | 'agent' | 'modelPlatform' | 'modelId' | 'status'>>): Session | null {
+export function updateSession(
+  userId: string,
+  id: string,
+  patch: Partial<Pick<Session, 'title' | 'agent' | 'modelPlatform' | 'modelId' | 'status'>>,
+): Session | null {
   const db = getDb();
-  const current = getSession(id);
+  const current = getSession(id, userId);
   if (!current) return null;
   const next = { ...current, ...patch };
-  db.prepare(`UPDATE agent_sessions SET title=?, agent=?, model_platform=?, model_id=?, status=?, updated_at=? WHERE id=?`)
-    .run(next.title, next.agent, next.modelPlatform, next.modelId, next.status, now(), id);
-  return getSession(id);
+  db.prepare(`UPDATE agent_sessions SET title=?, agent=?, model_platform=?, model_id=?, status=?, updated_at=? WHERE id=? AND user_id=?`)
+    .run(next.title, next.agent, next.modelPlatform, next.modelId, next.status, now(), id, userId);
+  return getSession(id, userId);
 }
 
 export function touchSession(id: string, status?: Session['status']): void {
@@ -132,8 +149,8 @@ export function touchSession(id: string, status?: Session['status']): void {
   else getDb().prepare('UPDATE agent_sessions SET updated_at=? WHERE id=?').run(now(), id);
 }
 
-export function deleteSession(id: string): boolean {
-  return getDb().prepare('DELETE FROM agent_sessions WHERE id=?').run(id).changes > 0;
+export function deleteSession(id: string, userId: string): boolean {
+  return getDb().prepare('DELETE FROM agent_sessions WHERE id=? AND user_id=?').run(id, userId).changes > 0;
 }
 
 /** Raw ModelMessage[] from the AI SDK, persisted so multi-turn tool calls keep their context. */
@@ -239,11 +256,11 @@ export function findPartByToolCall(toolCallId: string): Part | null {
 }
 
 // ---------------------------------------------------------------------------
-// Settings (stored in the inherited `settings` key/value table)
+// Settings (per-account key/value table; global `settings` is legacy seed data)
 // ---------------------------------------------------------------------------
 
-export function getSettings(): AppSettings {
-  const rows = getDb().prepare("SELECT key, value FROM settings WHERE key LIKE 'agent:%'").all() as Row[];
+export function getSettings(userId: string): AppSettings {
+  const rows = getDb().prepare("SELECT key, value FROM agent_user_settings WHERE user_id=? AND key LIKE 'agent:%'").all(userId) as Row[];
   const map = new Map(rows.map(r => [r.key, r.value]));
   const str = (k: string, d: string) => map.get(k) ?? d;
   return {
@@ -257,7 +274,7 @@ export function getSettings(): AppSettings {
   };
 }
 
-export function setSettings(patch: Partial<AppSettings>): AppSettings {
+export function setSettings(userId: string, patch: Partial<AppSettings>): AppSettings {
   const db = getDb();
   const entries: Array<[string, string]> = [];
   if (patch.defaultPlatform !== undefined) entries.push(['agent:default_platform', patch.defaultPlatform ?? '']);
@@ -267,21 +284,21 @@ export function setSettings(patch: Partial<AppSettings>): AppSettings {
   if (patch.maxSteps !== undefined) entries.push(['agent:max_steps', String(patch.maxSteps)]);
   if (patch.theme !== undefined) entries.push(['agent:theme', patch.theme]);
   if (patch.systemPromptSuffix !== undefined) entries.push(['agent:system_prompt_suffix', patch.systemPromptSuffix]);
-  const stmt = db.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
-  db.transaction(() => entries.forEach(([k, v]) => stmt.run(k, v)))();
-  return getSettings();
+  const stmt = db.prepare('INSERT INTO agent_user_settings (user_id,key,value) VALUES (?,?,?) ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value');
+  db.transaction(() => entries.forEach(([k, v]) => stmt.run(userId, k, v)))();
+  return getSettings(userId);
 }
 
 // ---------------------------------------------------------------------------
 // Model catalog & provider keys (reused tables)
 // ---------------------------------------------------------------------------
 
-export function getModels(): ModelInfo[] {
+export function getModels(userId: string): ModelInfo[] {
   const rows = getDb().prepare(`
     SELECT m.*,
-      EXISTS(SELECT 1 FROM api_keys k WHERE k.platform=m.platform AND k.enabled=1) AS has_key
+      EXISTS(SELECT 1 FROM api_keys k WHERE k.platform=m.platform AND k.enabled=1 AND k.user_id=?) AS has_key
     FROM models m ORDER BY m.enabled DESC, m.intelligence_rank ASC, m.display_name ASC
-  `).all() as Row[];
+  `).all(userId) as Row[];
   return rows.map(r => ({
     id: r.id,
     platform: r.platform as Platform,
@@ -298,23 +315,23 @@ export function getModels(): ModelInfo[] {
   }));
 }
 
-export function getModel(platform: Platform, modelId: string): ModelInfo | null {
-  return getModels().find(m => m.platform === platform && m.modelId === modelId) ?? null;
+export function getModel(platform: Platform, modelId: string, userId: string): ModelInfo | null {
+  return getModels(userId).find(m => m.platform === platform && m.modelId === modelId) ?? null;
 }
 
-export function getFallbackChain(limit = 5): ModelInfo[] {
+export function getFallbackChain(userId: string, limit = 5): ModelInfo[] {
   const rows = getDb().prepare(`
     SELECT m.* FROM fallback_config f JOIN models m ON m.id=f.model_db_id
     WHERE f.enabled=1 AND m.enabled=1 AND m.supports_tools=1
-      AND EXISTS(SELECT 1 FROM api_keys k WHERE k.platform=m.platform AND k.enabled=1)
+      AND EXISTS(SELECT 1 FROM api_keys k WHERE k.platform=m.platform AND k.enabled=1 AND k.user_id=?)
     ORDER BY f.priority ASC LIMIT ?
-  `).all(limit) as Row[];
-  const all = getModels();
+  `).all(userId, limit) as Row[];
+  const all = getModels(userId);
   return rows.map(r => all.find(m => m.id === r.id)!).filter(Boolean);
 }
 
-export function getApiKeys(): ApiKeyInfo[] {
-  const rows = getDb().prepare('SELECT * FROM api_keys ORDER BY platform, id').all() as Row[];
+export function getApiKeys(userId: string): ApiKeyInfo[] {
+  const rows = getDb().prepare('SELECT * FROM api_keys WHERE user_id=? ORDER BY platform, id').all(userId) as Row[];
   return rows.map(r => {
     let maskedKey = '****';
     let decryptable = false;
@@ -335,9 +352,9 @@ export function getApiKeys(): ApiKeyInfo[] {
   });
 }
 
-export function getProviderInfos() {
-  const models = getModels();
-  const keys = getApiKeys();
+export function getProviderInfos(userId: string) {
+  const models = getModels(userId);
+  const keys = getApiKeys(userId);
   return providerCatalog.map(p => ({
     ...p,
     configured: keys.some(k => k.platform === p.platform && k.enabled && k.decryptable) || p.keyless,
@@ -345,31 +362,55 @@ export function getProviderInfos() {
   }));
 }
 
-export function addApiKey(input: { platform: Platform; key: string; label?: string; baseUrl?: string }): ApiKeyInfo {
+export function addApiKey(
+  userId: string,
+  input: { platform: Platform; key: string; label?: string; baseUrl?: string },
+): ApiKeyInfo {
   const { encrypted, iv, authTag } = encrypt(input.key);
   const info = getDb().prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url, created_at)
-    VALUES (?,?,?,?,?, 'unknown', 1, ?, ?)
-  `).run(input.platform, input.label ?? '', encrypted, iv, authTag, input.baseUrl || null, now());
-  return getApiKeys().find(k => k.id === Number(info.lastInsertRowid))!;
+    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url, user_id, created_at)
+    VALUES (?,?,?,?,?, 'unknown', 1, ?, ?, ?)
+  `).run(input.platform, input.label ?? '', encrypted, iv, authTag, input.baseUrl || null, userId, now());
+
+  // BYOK onboarding: pick a tool-capable model from a provider this account
+  // can actually pay for. Re-pick when the inherited default belongs to a
+  // provider with no key on THIS account (e.g. a fresh desktop install with
+  // an empty key ring), otherwise the composer would stay stuck on an unusable
+  // model until the user visited Settings manually.
+  const settings = getSettings(userId);
+  const usable = getModels(userId).filter(m => m.enabled && m.supportsTools && m.hasKey);
+  const defaultUsable = usable.some(m =>
+    m.platform === settings.defaultPlatform && m.modelId === settings.defaultModelId);
+  if ((!settings.defaultPlatform || !settings.defaultModelId || !defaultUsable) && usable.length) {
+    const best = usable[0];
+    setSettings(userId, { defaultPlatform: best.platform, defaultModelId: best.modelId });
+  }
+  return getApiKeys(userId).find(k => k.id === Number(info.lastInsertRowid))!;
 }
 
-export function setApiKeyEnabled(id: number, enabled: boolean): void {
-  getDb().prepare('UPDATE api_keys SET enabled=? WHERE id=?').run(enabled ? 1 : 0, id);
+export function setApiKeyEnabled(userId: string, id: number, enabled: boolean): void {
+  getDb().prepare('UPDATE api_keys SET enabled=? WHERE id=? AND user_id=?').run(enabled ? 1 : 0, id, userId);
 }
 
-export function deleteApiKey(id: number): boolean {
-  return getDb().prepare('DELETE FROM api_keys WHERE id=?').run(id).changes > 0;
+export function deleteApiKey(userId: string, id: number): boolean {
+  return getDb().prepare('DELETE FROM api_keys WHERE id=? AND user_id=?').run(id, userId).changes > 0;
 }
 
-/** Returns the decrypted credential + endpoint for a platform. */
-export function resolveCredential(platform: Platform): { apiKey: string; baseUrl: string; keyless: boolean } | null {
+/**
+ * Returns the decrypted credential for a platform, looked up ONLY in this
+ * account's key ring. This is the boundary that makes BYOK real: there is no
+ * code path that falls back to a shared/global key.
+ */
+export function resolveCredential(
+  platform: Platform,
+  userId: string,
+): { apiKey: string; baseUrl: string; keyless: boolean } | null {
   const provider = providerByPlatform(platform);
   if (!provider) return null;
   const row = getDb().prepare(`
-    SELECT * FROM api_keys WHERE platform=? AND enabled=1 ORDER BY
+    SELECT * FROM api_keys WHERE platform=? AND enabled=1 AND user_id=? ORDER BY
       CASE status WHEN 'healthy' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END, id LIMIT 1
-  `).get(platform) as Row | undefined;
+  `).get(platform, userId) as Row | undefined;
 
   if (provider.keyless) {
     return { apiKey: row ? tryDecrypt(row) : 'no-key', baseUrl: provider.baseUrl, keyless: true };
@@ -392,19 +433,19 @@ function tryDecrypt(row: Row): string {
 export function logRequest(input: {
   platform: Platform; modelId: string; status: string; sessionId?: string;
   inputTokens?: number; outputTokens?: number; latencyMs?: number; error?: string | null; agent?: AgentMode;
-  keyId?: number | null;
+  keyId?: number | null; userId: string;
 }): void {
   try {
     getDb().prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, created_at, request_type, session_id, agent)
-      VALUES (?,?,?,?,?,?,?,?,?,'agent',?,?)
+      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, created_at, request_type, session_id, agent, user_id)
+      VALUES (?,?,?,?,?,?,?,?,?,'agent',?,?,?)
     `).run(input.platform, input.modelId, input.keyId ?? null, input.status,
       input.inputTokens ?? 0, input.outputTokens ?? 0, input.latencyMs ?? 0, input.error ?? null,
-      now(), input.sessionId ?? null, input.agent ?? 'build');
+      now(), input.sessionId ?? null, input.agent ?? 'build', input.userId);
   } catch { /* telemetry must never break a chat turn */ }
 }
 
-export function getAnalytics() {
+export function getAnalytics(userId: string) {
   const db = getDb();
   const totals = db.prepare(`
     SELECT COUNT(*) AS requests,
@@ -412,12 +453,12 @@ export function getAnalytics() {
            SUM(output_tokens) AS output_tokens,
            ROUND(AVG(latency_ms)) AS avg_latency,
            SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) AS errors
-    FROM requests
-  `).get() as Row;
+    FROM requests WHERE user_id=?
+  `).get(userId) as Row;
   const byPlatform = db.prepare(`
     SELECT platform, COUNT(*) AS requests, SUM(input_tokens+output_tokens) AS tokens
-    FROM requests GROUP BY platform ORDER BY requests DESC LIMIT 20
-  `).all() as Row[];
+    FROM requests WHERE user_id=? GROUP BY platform ORDER BY requests DESC LIMIT 20
+  `).all(userId) as Row[];
   return {
     requests: totals.requests ?? 0,
     inputTokens: totals.input_tokens ?? 0,
@@ -437,16 +478,22 @@ const mapPermission = (r: Row): PermissionRequest => ({
   input: safeJson(r.input_json, {}), status: r.status, createdAt: r.created_at,
 });
 
-export function createPermission(sessionId: string, toolCallId: string, toolName: string, input: unknown): PermissionRequest {
+export function createPermission(
+  sessionId: string, toolCallId: string, toolName: string, input: unknown, userId: string,
+): PermissionRequest {
   const id = randomUUID();
-  getDb().prepare('INSERT INTO agent_permissions (id, session_id, tool_call_id, tool_name, input_json, status, created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(id, sessionId, toolCallId, toolName, JSON.stringify(input ?? {}), 'pending', now());
+  getDb().prepare('INSERT INTO agent_permissions (id, session_id, tool_call_id, tool_name, input_json, status, created_at, user_id) VALUES (?,?,?,?,?,?,?,?)')
+    .run(id, sessionId, toolCallId, toolName, JSON.stringify(input ?? {}), 'pending', now(), userId);
   return mapPermission(getDb().prepare('SELECT * FROM agent_permissions WHERE id=?').get(id) as Row);
 }
 
-export function resolvePermission(id: string, status: PermissionRequest['status']): PermissionRequest | null {
+export function resolvePermission(
+  id: string, status: PermissionRequest['status'], userId?: string,
+): PermissionRequest | null {
   const db = getDb();
-  const row = db.prepare('SELECT * FROM agent_permissions WHERE id=?').get(id) as Row | undefined;
+  const row = userId
+    ? db.prepare('SELECT * FROM agent_permissions WHERE id=? AND user_id=?').get(id, userId) as Row | undefined
+    : db.prepare('SELECT * FROM agent_permissions WHERE id=?').get(id) as Row | undefined;
   if (!row) return null;
   db.prepare('UPDATE agent_permissions SET status=?, resolved_at=? WHERE id=?').run(status, now(), id);
   if (status === 'approved_always') {
@@ -493,8 +540,8 @@ export function getFileChanges(sessionId: string) {
     .map(r => ({ id: r.id, path: r.path, before: r.before_text, after: r.after_text, toolName: r.tool_name, createdAt: r.created_at }));
 }
 
-export function activePlatforms(): Platform[] {
-  const configured = new Set(getApiKeys().filter(k => k.enabled && k.decryptable).map(k => k.platform));
+export function activePlatforms(userId: string): Platform[] {
+  const configured = new Set(getApiKeys(userId).filter(k => k.enabled && k.decryptable).map(k => k.platform));
   return PLATFORMS.filter(p => configured.has(p) || providerByPlatform(p)?.keyless);
 }
 

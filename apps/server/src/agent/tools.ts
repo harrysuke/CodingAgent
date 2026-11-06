@@ -14,6 +14,10 @@ import { checkPermission } from './permissions';
 
 export interface ToolContext {
   sessionId: string;
+  /** Account that owns this run: keys, settings and permission rows. */
+  userId: string;
+  /** False for non-admin accounts: a shell could `cd ..` out of the sandbox. */
+  allowShell: boolean;
   assistantMessageId: string;
   root: string;
   agent: AgentMode;
@@ -60,7 +64,7 @@ export function createTools(ctx: ToolContext): ToolSet {
   ): Promise<ToolResult> {
     const partId = partFor(toolCallId, toolName, input);
     const permission = await checkPermission(
-      { sessionId: ctx.sessionId, toolCallId, toolName, input, signal: ctx.signal },
+      { sessionId: ctx.sessionId, userId: ctx.userId, toolCallId, toolName, input, signal: ctx.signal },
       ctx.permissionMode, ctx.agent,
     );
 
@@ -142,6 +146,15 @@ export function createTools(ctx: ToolContext): ToolSet {
       }),
       execute: async ({ command, workdir, timeoutMs }, { toolCallId }) => {
         const effectiveTimeout = timeoutMs ?? numberFrom(defaultsFor('bash').timeoutMs);
+        // A shell can escape any in-process path check, so regular accounts do
+        // not get one by default. They can still read/write/edit within their
+        // own workspace. Admins (the owner) keep the full toolset.
+        if (!ctx.allowShell) {
+          return run(toolCallId, 'bash', { command, workdir }, () => ({
+            error: 'Shell commands are disabled for this account. Use the read, write, edit, list, glob and grep tools instead.',
+            denied: true,
+          }));
+        }
         return run(toolCallId, 'bash', { command, workdir, timeoutMs: effectiveTimeout }, () =>
           runShell(resolveSafe(ctx.root, workdir ?? '.'), command, { timeoutMs: effectiveTimeout, signal: ctx.signal }));
       },
@@ -254,7 +267,7 @@ export function createTools(ctx: ToolContext): ToolSet {
       description: 'Read the current agent settings (active model info is in the system context).',
       inputSchema: z.object({}),
       execute: async (_args, { toolCallId }) =>
-        run(toolCallId, 'settings', {}, () => getSettings() as unknown as ToolResult),
+        run(toolCallId, 'settings', {}, () => getSettings(ctx.userId) as unknown as ToolResult),
     }),
   };
 
