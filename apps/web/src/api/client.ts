@@ -29,6 +29,12 @@ export const auth = reactive({
   user: null as AuthUser | null,
   status: null as AuthStatus | null,
   checked: false,
+  /**
+   * Incremented on every successful sign-in/sign-up. The root layout watches
+   * this synchronously to start account hydration before `auth.user` flips and
+   * unmounts the login view. An emit() after an awaited signIn() can be lost.
+   */
+  loginEpoch: 0,
   /** The server has no /api/auth/* routes: it is an older build. */
   staleServer: false,
   error: '',
@@ -178,6 +184,10 @@ export async function restoreSession(): Promise<void> {
 
 function applyAuthResult(result: AuthResult): void {
   setSessionToken(result.token);
+  // Arm the hydration gate BEFORE auth.user becomes non-null. Otherwise Vue
+  // unmounts AuthView in the same tick and its post-await emit('authenticated')
+  // is never delivered, leaving the chat UI mounted with an empty model list.
+  auth.loginEpoch++;
   auth.user = result.user;
   auth.checked = true;
   auth.error = '';

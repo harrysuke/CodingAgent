@@ -54,6 +54,12 @@ export const useAppStore = defineStore('app', () => {
   const usage = ref<Usage | null>(null);
   const error = ref('');
   const ready = ref(false);
+  /**
+   * True once every account-scoped collection (models, keys, sessions, …) has
+   * been fetched. The chat UI must not mount before this, otherwise the model
+   * picker renders an empty list on the first frame after signing in.
+   */
+  const hydrated = ref(false);
   const sidebarOpen = ref(true);
   const rightPanel = ref<'files' | 'changes' | 'todos' | null>('files');
 
@@ -100,6 +106,7 @@ export const useAppStore = defineStore('app', () => {
   // Bootstrap
   // -------------------------------------------------------------------------
   async function bootstrap(): Promise<void> {
+    hydrated.value = false;
     await initConnection();
     ready.value = true;
     // /api/health is public, so the offline screen works before login.
@@ -107,16 +114,41 @@ export const useAppStore = defineStore('app', () => {
     if (!health) {
       auth.user = null;
       auth.checked = true;
+      hydrated.value = true; // signed out: nothing account-scoped to load
       return;
     }
     await restoreSession();
-    if (!auth.user) return; // App.vue renders the sign-in / first-run screen.
-    await bootstrapData();
+    if (!auth.user) {
+      hydrated.value = true; // App.vue renders the sign-in / first-run screen
+      return;
+    }
+    try {
+      await bootstrapData();
+    } finally {
+      hydrated.value = true;
+    }
+  }
+
+  /**
+   * Called right after signIn/signUp. The auth result already gave us a valid
+   * session and `auth.user`, so re-running `restoreSession()` here would flip
+   * `auth.checked` back to false, unmount and remount the chat UI mid-flight,
+   * and leave the model picker rendered against an empty catalogue. Hydrate
+   * the account data directly instead.
+   */
+  async function afterLogin(): Promise<void> {
+    hydrated.value = false;
+    try {
+      await bootstrapData();
+    } finally {
+      hydrated.value = true;
+    }
   }
 
   /** Wipe every account-scoped collection when switching or signing out. */
   function resetAccountState(): void {
     stopEvents();
+    hydrated.value = false;
     sessions.value = [];
     messages.value = [];
     models.value = [];
@@ -659,7 +691,26 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function bootstrapData(): Promise<void> {
-    await Promise.all([loadSessions(), loadModels(), loadProviders(), loadKeys(), loadSettings(), loadWorkspace()]);
+    // One slow/failing endpoint must not abort the whole hydration: in
+    // particular a workspace error should never leave the model list empty.
+    // Health is refreshed *after* authentication so the sidebar and settings
+    // show the full workspace/db info rather than the anonymous sparse payload.
+    const labels = ['sessions', 'models', 'providers', 'keys', 'settings', 'workspace', 'health'] as const;
+    const results = await Promise.allSettled([
+      loadSessions(), loadModels(), loadProviders(), loadKeys(), loadSettings(), loadWorkspace(), checkHealth(),
+    ]);
+    const failures: string[] = [];
+    results.forEach((result, index) => {
+      if (result.status !== 'rejected') return;
+      const label = labels[index] ?? 'data';
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      console.warn(`[bootstrap] ${label} load failed:`, result.reason);
+      if (label !== 'health') failures.push(`${label}: ${reason}`);
+    });
+    if (failures.length) {
+      // Successful collections are still usable; App.vue shows a retry banner.
+      throw new Error(`Could not load some account data (${failures.join('; ')}).`);
+    }
     if (sessions.value.length) {
       const id = sessions.value.find(s => s.id === currentId.value)?.id ?? sessions.value[0].id;
       currentId.value = null;
@@ -676,13 +727,13 @@ export const useAppStore = defineStore('app', () => {
   return {
     sessions, projects, currentId, messages, models, providers, keys, settings,
     permissions, todos, fileChanges, fileTree, analytics,
-    running, usage, error, ready, sidebarOpen, rightPanel,
+    running, usage, error, ready, hydrated, sidebarOpen, rightPanel,
     currentSession, selectedModel, usableModels, pendingPermission, connection,
     workspace, workspaceBusy, workspaceStale, activeWorkspace,
     attachments,
     skills, skillDirectories, skillsBusy, skillsLog,
     terminalOpen, terminalId, terminalCwd, terminalShell, terminalLines, terminalError, terminalBusy,
-    bootstrap, loadTree, loadChanges, loadAnalytics,
+    bootstrap, afterLogin, loadTree, loadChanges, loadAnalytics,
     loadWorkspace, browseWorkspace, openWorkspace,
     addAttachment, removeAttachment, clearAttachments, attachDeviceFiles, kindOfName,
     loadSkills, installSkill, toggleSkill, removeSkill, pushSkillLog, pushTerminalLine,

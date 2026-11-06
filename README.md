@@ -3,7 +3,8 @@
 An OpenCode-style local coding agent: a Node.js/TypeScript agent engine, a Vue 3
 chat workspace, and Tauri 2 shells for desktop and mobile. It **reuses the
 SQLite model catalogue copied from `freellmapi`** (108 models, fallback
-configuration, provider registry).
+configuration, provider registry). Accounts and provider keys are local:
+the shipped database is sanitized before packaging.
 
 Everything runs on your machine. The UI talks to a localhost HTTP + SSE API;
 no cloud service, no telemetry. **Accounts are local and BYOK**: everyone signs

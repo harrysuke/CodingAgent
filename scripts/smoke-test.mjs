@@ -91,6 +91,36 @@ if (!base) {
   // a process-local index and must NOT be copied; SQLite rebuilds it.
   fs.copyFileSync(sourceDb, dbPath);
   if (fs.existsSync(sourceDb + '-wal')) fs.copyFileSync(sourceDb + '-wal', dbPath + '-wal');
+
+  // The live DB may already have an owner account (after migration) with keys,
+  // sessions and settings bound to it. The smoke suite deliberately tests the
+  // first-run setup flow, so its throwaway COPY must be reset to a pristine
+  // pre-account state. The real DB is never touched.
+  const nodeBin = workingNode();
+  const sanitizeSql = [
+    'DELETE FROM agent_user_sessions;',
+    'DELETE FROM agent_users;',
+    'DELETE FROM agent_user_settings;',
+    'DELETE FROM agent_sessions;',
+    'DELETE FROM agent_permissions;',
+    'DELETE FROM requests;',
+    "DELETE FROM settings WHERE key LIKE 'agent:%';",
+    'UPDATE api_keys SET user_id = NULL;',
+    'UPDATE projects SET user_id = NULL;',
+  ].join('\n');
+  execFileSync(nodeBin, ['-e', `
+    const D = require('better-sqlite3');
+    const db = new D(process.env.CA_SMOKE_DB_PATH);
+    db.pragma('journal_mode = DELETE');
+    db.exec(${JSON.stringify(sanitizeSql)});
+    db.exec('VACUUM');
+    db.close();
+  `], {
+    cwd: root,
+    env: { ...process.env, CA_SMOKE_DB_PATH: dbPath },
+    stdio: 'ignore',
+  });
+
   const workspaceRoot = path.join(tmpDir, 'workspaces');
   fs.mkdirSync(workspaceRoot, { recursive: true });
   smokeWorkspace = path.join(tmpDir, 'workspace');
@@ -105,7 +135,6 @@ if (!base) {
     console.error('Missing apps/server/dist/index.js — run `npm run build -w @codingagent/server` first.');
     process.exit(1);
   }
-  const nodeBin = workingNode();
   child = spawn(nodeBin, [entry], {
     cwd: root,
     env: {

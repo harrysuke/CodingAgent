@@ -8,8 +8,6 @@ import {
   setServerUrl, signIn, signUp,
 } from '../api/client';
 
-const emit = defineEmits<{ authenticated: [] }>();
-
 const mode = ref<'login' | 'register'>('login');
 const email = ref('');
 const password = ref('');
@@ -48,7 +46,8 @@ async function submit() {
       });
     }
     password.value = '';
-    emit('authenticated');
+    // No emit here: applyAuthResult() already signalled auth.loginEpoch before
+    // auth.user changed, and this component is about to be unmounted.
   } catch (err) {
     error.value = (err as Error).message;
   } finally {
