@@ -5,12 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {
   AgentEvent, AuthResult, BrowseResult, HealthResponse, InstallSkillResult, ResolveAttachmentsResult,
-  SkillsResponse, TerminalChunk, TerminalState, WorkspaceInfo, WorkspaceState,
+  SkillsResponse, TerminalChunk, TerminalShellsResponse, TerminalState, WorkspaceInfo, WorkspaceState,
 } from '@codingagent/shared';
 import {
-  ChangePasswordSchema, ChatRequestSchema, CreateKeySchema, CreateSessionSchema, InstallSkillSchema,
-  LoginSchema, OpenWorkspaceSchema, PermissionResolveSchema, RegisterSchema, ResolveAttachmentsSchema,
-  SettingsSchema, ToggleSkillSchema, UpdateSessionSchema,
+  ChangePasswordSchema, ChatRequestSchema, CreateKeySchema, CreateSessionSchema, CreateTerminalSchema,
+  InstallSkillSchema, LoginSchema, OpenWorkspaceSchema, PermissionResolveSchema, RegisterSchema,
+  ResolveAttachmentsSchema, SettingsSchema, TerminalInputSchema, TerminalResizeSchema,
+  ToggleSkillSchema, UpdateSessionSchema,
 } from '@codingagent/shared';
 import { env } from '../env';
 import { getDb } from '../db/client';
@@ -34,7 +35,8 @@ import {
 } from '../skills/registry';
 import {
   clearTerminalBuffer, createTerminal, disposeTerminal, getTerminal, interruptTerminal,
-  listTerminals, subscribeTerminal, terminalBacklog, writeTerminal,
+  listTerminals, ptyAvailable, resizeTerminal, restartTerminal, subscribeTerminal,
+  terminalBacklog, terminalShells, writeTerminal,
 } from '../terminal/manager';
 import type { Actor } from '../auth/service';
 import {
@@ -144,7 +146,7 @@ export function createApp() {
   // -----------------------------------------------------------------------
   // Health — public but deliberately sparse until a session is attached
   // -----------------------------------------------------------------------
-  app.get('/api/health', (c) => {
+  app.get('/api/health', async (c) => {
     const db = getDb();
     const models = (db.prepare('SELECT COUNT(*) AS n FROM models').get() as { n: number }).n;
     const actor = c.get('actor') as Actor | undefined;
@@ -167,6 +169,9 @@ export function createApp() {
       // Capability flag: the UI uses this to detect a stale server that would
       // silently ignore per-session folder binding.
       sessionWorkspaces: true,
+      // True only when the native PTY addon actually loaded: the Xterm.js UI
+      // must not stream raw keystrokes to an old, line-oriented server.
+      terminalPty: await ptyAvailable(),
     };
     return c.json(payload);
   });
@@ -470,20 +475,31 @@ export function createApp() {
   });
 
   // -----------------------------------------------------------------------
-  // Terminal: a persistent shell in the account's workspace root
+  // Terminal: real PTY shells, each bound to the open session's workspace
   // -----------------------------------------------------------------------
   app.get('/api/terminal', c => c.json(listTerminals(actorOf(c).userId)));
+
+  /** Shells the host can actually launch, for the "new tab" dropdown. */
+  app.get('/api/terminal/shells', async (c) => {
+    const payload: TerminalShellsResponse = terminalShells();
+    payload.pty = await ptyAvailable();
+    return c.json(payload);
+  });
 
   app.post('/api/terminal', async (c) => {
     const actor = actorOf(c);
     if (!actor.allowShell) {
       return c.json({ error: 'Shell access is disabled for this account. Ask the administrator to enable AGENT_ALLOW_USER_SHELL.' }, 403);
     }
-    const body = await c.req.json().catch(() => ({})) as { sessionId?: string };
+    const body = await parse(c, CreateTerminalSchema);
     try {
-      // The shell is spawned once and keeps its cwd, so start it in the folder
-      // belonging to the session that opened the terminal.
-      const state: TerminalState = createTerminal(rootForSession(body.sessionId, actor), actor.userId);
+      // The shell keeps its cwd, so start it in the folder belonging to the
+      // session that opened the terminal — never the account-wide pointer.
+      const state: TerminalState = await createTerminal(
+        rootForSession(body.sessionId, actor),
+        actor.userId,
+        { cols: body.cols, rows: body.rows, shell: body.shell },
+      );
       return c.json(state, 201);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
@@ -505,11 +521,13 @@ export function createApp() {
         if (closed) return;
         void stream.writeSSE({ data: JSON.stringify(chunk), event: 'chunk' }).catch(() => {});
       };
-      // Replay the scrollback so a reconnecting UI is not left with a blank shell.
-      for (const chunk of terminalBacklog(id, actor.userId)) write(chunk);
       const unsubscribe = subscribeTerminal(id, write, actor.userId);
       if (!unsubscribe) { closed = true; return; }
       stream.onAbort(() => { closed = true; unsubscribe(); });
+      // The UI rebuilds its Xterm.js buffer from the replay below. A reset
+      // frame first prevents duplicated scrollback after a reconnect.
+      write({ terminalId: id, stream: 'reset', data: '', at: new Date().toISOString() });
+      for (const chunk of terminalBacklog(id, actor.userId)) write(chunk);
       await stream.writeSSE({ data: JSON.stringify({ terminalId: id }), event: 'ready' });
 
       while (!closed) {
@@ -522,14 +540,24 @@ export function createApp() {
   });
 
   app.post('/api/terminal/:id/input', async (c) => {
-    const body = await c.req.json().catch(() => ({})) as { data?: string };
-    if (typeof body.data !== 'string') return c.json({ error: 'data must be a string' }, 400);
+    const body = await parse(c, TerminalInputSchema);
     return writeTerminal(c.req.param('id'), body.data, actorOf(c).userId)
       ? c.json({ ok: true })
       : c.json({ error: 'Terminal not found' }, 404);
   });
 
+  app.post('/api/terminal/:id/resize', async (c) => {
+    const body = await parse(c, TerminalResizeSchema);
+    return resizeTerminal(c.req.param('id'), body.cols, body.rows, actorOf(c).userId)
+      ? c.json({ ok: true })
+      : c.json({ error: 'Terminal not found' }, 404);
+  });
+
   app.post('/api/terminal/:id/interrupt', c => c.json({ ok: interruptTerminal(c.req.param('id'), actorOf(c).userId) }));
+  app.post('/api/terminal/:id/restart', (c) => {
+    const state = restartTerminal(c.req.param('id'), actorOf(c).userId);
+    return state ? c.json(state) : c.json({ error: 'Terminal not found' }, 404);
+  });
   app.post('/api/terminal/:id/clear', c => c.json({ ok: clearTerminalBuffer(c.req.param('id'), actorOf(c).userId) }));
   app.delete('/api/terminal/:id', c => c.json({ deleted: disposeTerminal(c.req.param('id'), actorOf(c).userId) }));
 

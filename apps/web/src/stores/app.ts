@@ -3,7 +3,8 @@ import { computed, ref, watch } from 'vue';
 import type {
   AgentEvent, ApiKeyInfo, AppSettings, BrowseResult, FileNode, HealthResponse, InstallSkillResult,
   Message, ModelInfo, Part, PermissionRequest, Project, ProviderInfo, Session, SkillInfo, SkillsResponse,
-  TerminalChunk, TerminalState, TodoItem, Usage, WorkspaceInfo, WorkspaceState,
+  TerminalChunk, TerminalShellInfo, TerminalShellsResponse, TerminalState, TodoItem, Usage,
+  WorkspaceInfo, WorkspaceState,
 } from '@codingagent/shared';
 import { DEFAULT_SETTINGS } from '@codingagent/shared';
 import {
@@ -34,6 +35,23 @@ export interface TerminalLine {
   data: string;
   at: string;
 }
+
+/** Metadata for one Xterm.js tab. The emulator viewport lives in TerminalView. */
+export interface TerminalTab {
+  id: string;
+  title: string;
+  cwd: string;
+  shell: string;
+  shellId: string;
+  pty: boolean;
+  cols: number;
+  rows: number;
+  running: boolean;
+  createdAt: string;
+}
+
+/** A live view registers itself here to receive its PTY's raw output. */
+export type TerminalSink = (chunk: TerminalChunk) => void;
 
 /**
  * The folder picker is shared by the sidebar's "New session" button and the
@@ -94,6 +112,10 @@ export const useAppStore = defineStore('app', () => {
     { immediate: true },
   );
 
+  /** Xterm.js sends raw keystrokes; an old line-oriented server cannot use them. */
+  const terminalOutdated = computed(() =>
+    !!connection.health && connection.health.terminalPty !== true);
+
   const STALE_SERVER_MESSAGE = 'The CodingAgent server is running an older build that cannot bind folders to sessions. '
     + 'Stop it and run `npm start` (or `npm run dev`) again, then reload this page before choosing a folder.';
 
@@ -131,13 +153,32 @@ export const useAppStore = defineStore('app', () => {
   const skillsLog = ref<string[]>([]);
 
   const terminalOpen = ref(false);
-  const terminalId = ref<string | null>(null);
-  const terminalCwd = ref('');
-  const terminalShell = ref('');
-  const terminalLines = ref<TerminalLine[]>([]);
+  /** All shells stay alive while the dock is hidden, like a desktop IDE. */
+  const terminalTabs = ref<TerminalTab[]>([]);
+  const activeTerminalId = ref<string | null>(null);
+  const terminalShellOptions = ref<TerminalShellInfo[]>([]);
+  const terminalDefaultShell = ref('');
+  const terminalPtyAvailable = ref(false);
   const terminalError = ref('');
   const terminalBusy = ref(false);
-  let terminalAbort: AbortController | null = null;
+  /** Legacy line log, still used to echo skill-install output into the shell. */
+  const terminalLines = ref<TerminalLine[]>([]);
+
+  // Non-reactive plumbing: SSE controllers, viewport subscribers, and a
+  // per-tab serial write chain that batches Xterm.js keystrokes into one POST.
+  const terminalAborts = new Map<string, AbortController>();
+  const terminalSinks = new Map<string, Set<TerminalSink>>();
+  /** Mirror of each tab's visible scrollback, so a late-mounting viewport can replay it. */
+  const terminalBacklogs = new Map<string, TerminalChunk[]>();
+  const terminalChains = new Map<string, Promise<void>>();
+  const terminalQueues = new Map<string, { parts: string[]; timer: ReturnType<typeof setTimeout> | null }>();
+
+  const activeTerminal = computed(() => terminalTabs.value.find(t => t.id === activeTerminalId.value) ?? null);
+  /** Kept as aliases so existing UI bindings keep working. */
+  const terminalId = computed(() => activeTerminalId.value);
+  const terminalCwd = computed(() => activeTerminal.value?.cwd ?? '');
+  const terminalShell = computed(() => activeTerminal.value?.shell ?? '');
+  const terminalPty = computed(() => activeTerminal.value?.pty ?? false);
 
   const activeWorkspace = computed(() => workspace.value?.active ?? null);
 
@@ -215,8 +256,11 @@ export const useAppStore = defineStore('app', () => {
     workspacePicker.value = { open: false, mode: 'current-session' };
     attachments.value = [];
     skills.value = [];
-    terminalId.value = null;
-    terminalLines.value = [];
+    // Shells are account-scoped: signing out must not leave PTYs running.
+    for (const tab of terminalTabs.value) {
+      void apiFetch(`/api/terminal/${tab.id}`, { method: 'DELETE' }).catch(() => {});
+    }
+    disposeTerminalState();
     currentId.value = null;
     error.value = '';
     running.value = false;
@@ -479,93 +523,331 @@ export const useAppStore = defineStore('app', () => {
   }
 
   // -------------------------------------------------------------------------
-  // Terminal: persistent shell in the workspace root
+  // Terminal: Xterm.js tabs over real PTY shells in the session's workspace
   // -------------------------------------------------------------------------
-  function pushTerminalLine(line: TerminalLine): void {
+  function dispatchTerminalChunk(chunk: TerminalChunk): void {
+    // Keep a replay mirror in sync with what a live viewport sees. A `reset`
+    // starts a fresh transcript (SSE replay, restart, or clear).
+    let backlog = terminalBacklogs.get(chunk.terminalId);
+    if (chunk.stream === 'reset') {
+      backlog = [];
+      terminalBacklogs.set(chunk.terminalId, backlog);
+    } else if (backlog) {
+      backlog.push(chunk);
+      if (backlog.length > 8000) backlog.splice(0, backlog.length - 8000);
+    }
+    const sinks = terminalSinks.get(chunk.terminalId);
+    if (!sinks) return;
+    for (const sink of [...sinks]) {
+      try { sink(chunk); } catch { /* the view unmounted mid-frame */ }
+    }
+  }
+
+  function appendTerminalLine(line: TerminalLine): void {
     terminalLines.value.push(line);
     if (terminalLines.value.length > 3000) {
       terminalLines.value.splice(0, terminalLines.value.length - 3000);
     }
   }
 
-  function connectTerminal(id: string): void {
-    terminalAbort?.abort();
-    const controller = new AbortController();
-    terminalAbort = controller;
-    void (async () => {
+  /** Skills install output is echoed into the active shell as dim system text. */
+  function pushTerminalLine(line: TerminalLine): void {
+    appendTerminalLine(line);
+    const id = activeTerminalId.value;
+    if (!id) return;
+    dispatchTerminalChunk({
+      terminalId: id,
+      stream: 'system',
+      data: `\x1b[2m${line.data.replace(/\r?\n/g, '\r\n')}\x1b[0m`,
+      at: line.at,
+    });
+  }
+
+  /**
+   * Register an Xterm.js viewport for one tab. The SSE connection can start
+   * before Vue has mounted the viewport, so replay the mirrored scrollback to
+   * every late subscriber (preceded by a reset to avoid duplicated output).
+   */
+  function subscribeTerminalData(id: string, sink: TerminalSink): () => void {
+    let set = terminalSinks.get(id);
+    if (!set) { set = new Set(); terminalSinks.set(id, set); }
+    set.add(sink);
+    const backlog = terminalBacklogs.get(id);
+    if (backlog?.length) {
       try {
-        await streamTerminal(id, chunk => {
-          if (chunk.terminalId !== terminalId.value) return;
-          pushTerminalLine({ stream: chunk.stream, data: chunk.data, at: chunk.at });
-        }, controller.signal);
-      } catch (err) {
-        if (controller.signal.aborted) return;
-        terminalError.value = (err as Error).message;
-        // The shell dies with the server; drop the id so the next open respawns.
-        terminalId.value = null;
+        sink({ terminalId: id, stream: 'reset', data: '', at: new Date().toISOString() });
+        for (const chunk of backlog) sink(chunk);
+      } catch { /* a half-initialised viewport must not break the store */ }
+    }
+    return () => {
+      set?.delete(sink);
+      if (set && !set.size) terminalSinks.delete(id);
+    };
+  }
+
+  function emitTerminalReset(id: string): void {
+    dispatchTerminalChunk({ terminalId: id, stream: 'reset', data: '', at: new Date().toISOString() });
+  }
+
+  function markTab(id: string, state: TerminalState): void {
+    const tab = terminalTabs.value.find(t => t.id === id);
+    if (!tab) return;
+    tab.cwd = state.cwd;
+    tab.shell = state.shell;
+    tab.shellId = state.shellId || tab.shellId;
+    tab.pty = !!state.pty;
+    tab.cols = state.cols || tab.cols;
+    tab.rows = state.rows || tab.rows;
+    tab.running = state.running;
+  }
+
+  /**
+   * SSE streams are long-lived, but a proxy timeout or a server restart can
+   * close one. Replay frames (`reset` + scrollback) make a reconnect lossless,
+   * so retry with bounded backoff instead of leaving a dead tab on screen.
+   */
+  function connectTerminal(id: string): void {
+    terminalAborts.get(id)?.abort();
+    const controller = new AbortController();
+    terminalAborts.set(id, controller);
+    let attempt = 0;
+    void (async () => {
+      while (!controller.signal.aborted && terminalTabs.value.some(t => t.id === id)) {
+        let received = false;
+        const startedAt = Date.now();
+        try {
+          await streamTerminal(id, chunk => {
+            if (chunk.terminalId !== id) return;
+            if (!received) {
+              received = true;
+              terminalError.value = '';
+            }
+            appendTerminalLine({ stream: chunk.stream, data: chunk.data, at: chunk.at });
+            dispatchTerminalChunk(chunk);
+          }, controller.signal);
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          const message = (err as Error).message;
+          // A disposed terminal or revoked session will never come back.
+          if (/\b(401|403|404)\b/.test(message)) {
+            terminalError.value = message;
+            const tab = terminalTabs.value.find(t => t.id === id);
+            if (tab) tab.running = false;
+            return;
+          }
+          terminalError.value = message;
+        }
+        if (controller.signal.aborted || !terminalTabs.value.some(t => t.id === id)) return;
+        // Only a stream that stayed up counts as a healthy connection; otherwise
+        // a server that closes every SSE immediately would be hammered at 400ms.
+        const healthy = received && Date.now() - startedAt > 10_000;
+        attempt = healthy ? 0 : Math.min(attempt + 1, 4);
+        await new Promise(resolve => setTimeout(resolve, Math.min(4000, 400 * 2 ** attempt)));
+        if (controller.signal.aborted || !terminalTabs.value.some(t => t.id === id)) return;
+        try {
+          // Resync geometry / running state, and stop if the shell is gone.
+          const states = await apiFetch<TerminalState[]>('/api/terminal');
+          const state = states.find(s => s.id === id);
+          if (!state) return;
+          markTab(id, state);
+        } catch { /* transient; the next reconnect will try again */ }
       }
     })();
   }
 
-  async function ensureTerminal(): Promise<void> {
-    terminalError.value = '';
-    if (terminalId.value) return;
+  async function loadTerminalShells(): Promise<void> {
+    try {
+      const data = await apiFetch<TerminalShellsResponse>('/api/terminal/shells');
+      terminalShellOptions.value = data.shells;
+      terminalDefaultShell.value = data.defaultShell;
+      terminalPtyAvailable.value = data.pty;
+    } catch {
+      terminalShellOptions.value = [];
+      terminalPtyAvailable.value = false;
+    }
+  }
+
+  function newTabFrom(state: TerminalState): TerminalTab {
+    return {
+      id: state.id,
+      title: `${state.shell} ${terminalTabs.value.length + 1}`,
+      cwd: state.cwd,
+      shell: state.shell,
+      shellId: state.shellId || terminalDefaultShell.value,
+      pty: !!state.pty,
+      cols: state.cols || 80,
+      rows: state.rows || 24,
+      running: state.running,
+      createdAt: state.createdAt,
+    };
+  }
+
+  /** Spawn an additional shell. Each tab owns its PTY and its own scrollback. */
+  async function createTerminalTab(options: { shell?: string; cols?: number; rows?: number } = {}): Promise<TerminalTab | null> {
+    if (terminalOutdated.value) {
+      terminalError.value = 'The server is running an older terminal build without PTY support. '
+        + 'Restart the CodingAgent server and reload this page to use the new terminal.';
+      return null;
+    }
     terminalBusy.value = true;
+    terminalError.value = '';
     try {
       const state = await apiFetch<TerminalState>('/api/terminal', {
         method: 'POST',
-        body: JSON.stringify({ sessionId: currentId.value ?? undefined }),
+        body: JSON.stringify({
+          sessionId: currentId.value ?? undefined,
+          shell: options.shell || terminalDefaultShell.value || undefined,
+          cols: options.cols || 80,
+          rows: options.rows || 24,
+        }),
       });
-      terminalId.value = state.id;
-      terminalCwd.value = state.cwd;
-      terminalShell.value = state.shell;
-      terminalLines.value = [];
-      connectTerminal(state.id);
+      const tab = newTabFrom(state);
+      terminalBacklogs.set(tab.id, []);
+      terminalTabs.value.push(tab);
+      activeTerminalId.value = tab.id;
+      connectTerminal(tab.id);
+      return tab;
     } catch (err) {
       terminalError.value = (err as Error).message;
+      return null;
     } finally {
       terminalBusy.value = false;
     }
   }
 
-  async function sendTerminal(data: string): Promise<void> {
-    if (!terminalId.value) await ensureTerminal();
-    const id = terminalId.value;
-    if (!id) return;
+  async function ensureTerminal(): Promise<void> {
+    if (terminalTabs.value.length) return;
+    if (!terminalShellOptions.value.length) await loadTerminalShells();
+    await createTerminalTab();
+  }
+
+  /**
+   * Xterm.js emits one `onData` event per keystroke. Coalesce a burst into a
+   * single POST and keep a per-tab serial chain so ordering is never lost.
+   */
+  function enqueueTerminalInput(id: string, data: string): void {
+    let queue = terminalQueues.get(id);
+    if (!queue) { queue = { parts: [], timer: null }; terminalQueues.set(id, queue); }
+    queue.parts.push(data);
+    if (queue.timer) return;
+    queue.timer = setTimeout(() => {
+      const entry = terminalQueues.get(id);
+      if (!entry) return;
+      entry.timer = null;
+      const payload = entry.parts.join('');
+      entry.parts = [];
+      if (payload) void flushTerminalInput(id, payload);
+    }, 12);
+  }
+
+  function flushTerminalInput(id: string, payload: string): Promise<void> {
+    const previous = terminalChains.get(id) ?? Promise.resolve();
+    const next = previous.then(async () => {
+      try {
+        await apiFetch(`/api/terminal/${id}/input`, {
+          method: 'POST', body: JSON.stringify({ data: payload }),
+        });
+      } catch (err) {
+        terminalError.value = (err as Error).message;
+      }
+    });
+    terminalChains.set(id, next);
+    void next.then(() => { if (terminalChains.get(id) === next) terminalChains.delete(id); });
+    return next;
+  }
+
+  /** Raw bytes, not a command line. Omit `id` to target the active tab. */
+  async function sendTerminal(data: string, id?: string): Promise<void> {
+    let target = id ?? activeTerminalId.value;
+    if (!target) {
+      await ensureTerminal();
+      target = activeTerminalId.value;
+    }
+    if (!target) return;
+    enqueueTerminalInput(target, data);
+  }
+
+  async function resizeTerminal(id: string, cols: number, rows: number): Promise<void> {
+    const tab = terminalTabs.value.find(t => t.id === id);
+    if (tab) { tab.cols = cols; tab.rows = rows; }
+    await apiFetch(`/api/terminal/${id}/resize`, {
+      method: 'POST', body: JSON.stringify({ cols, rows }),
+    }).catch(() => { /* a dead shell will report its own error */ });
+  }
+
+  async function interruptTerminal(id?: string): Promise<void> {
+    const target = id ?? activeTerminalId.value;
+    if (!target) return;
+    await apiFetch(`/api/terminal/${target}/interrupt`, { method: 'POST' }).catch(() => {});
+  }
+
+  async function restartTerminal(id?: string): Promise<void> {
+    const target = id ?? activeTerminalId.value;
+    if (!target) return;
+    emitTerminalReset(target);
     try {
-      await apiFetch(`/api/terminal/${id}/input`, { method: 'POST', body: JSON.stringify({ data }) });
+      const state = await apiFetch<TerminalState>(`/api/terminal/${target}/restart`, { method: 'POST' });
+      markTab(target, state);
     } catch (err) {
       terminalError.value = (err as Error).message;
     }
   }
 
-  async function interruptTerminal(): Promise<void> {
-    if (!terminalId.value) return;
-    await apiFetch(`/api/terminal/${terminalId.value}/interrupt`, { method: 'POST' }).catch(() => {});
-  }
-
-  async function clearTerminal(): Promise<void> {
+  async function clearTerminal(id?: string): Promise<void> {
+    const target = id ?? activeTerminalId.value;
+    if (!target) return;
     terminalLines.value = [];
-    if (!terminalId.value) return;
-    await apiFetch(`/api/terminal/${terminalId.value}/clear`, { method: 'POST' }).catch(() => {});
+    emitTerminalReset(target);
+    await apiFetch(`/api/terminal/${target}/clear`, { method: 'POST' }).catch(() => {});
   }
 
+  async function closeTerminalTab(id: string): Promise<void> {
+    terminalAborts.get(id)?.abort();
+    terminalAborts.delete(id);
+    terminalSinks.delete(id);
+    terminalBacklogs.delete(id);
+    terminalChains.delete(id);
+    const queue = terminalQueues.get(id);
+    if (queue?.timer) clearTimeout(queue.timer);
+    terminalQueues.delete(id);
+    const index = terminalTabs.value.findIndex(t => t.id === id);
+    terminalTabs.value = terminalTabs.value.filter(t => t.id !== id);
+    if (activeTerminalId.value === id) {
+      activeTerminalId.value = terminalTabs.value[Math.max(0, index - 1)]?.id
+        ?? terminalTabs.value[0]?.id ?? null;
+    }
+    await apiFetch(`/api/terminal/${id}`, { method: 'DELETE' }).catch(() => {});
+  }
+
+  /** Backwards-compatible alias for callers that only know "the" terminal. */
   async function closeTerminal(): Promise<void> {
-    terminalAbort?.abort();
-    terminalAbort = null;
-    const id = terminalId.value;
-    terminalId.value = null;
+    const id = activeTerminalId.value;
+    if (id) await closeTerminalTab(id);
+  }
+
+  function disposeTerminalState(): void {
+    for (const controller of terminalAborts.values()) controller.abort();
+    terminalAborts.clear();
+    terminalSinks.clear();
+    terminalBacklogs.clear();
+    terminalChains.clear();
+    for (const queue of terminalQueues.values()) if (queue.timer) clearTimeout(queue.timer);
+    terminalQueues.clear();
+    terminalTabs.value = [];
+    activeTerminalId.value = null;
     terminalLines.value = [];
-    if (id) await apiFetch(`/api/terminal/${id}`, { method: 'DELETE' }).catch(() => {});
+    terminalError.value = '';
   }
 
   /**
    * A shell keeps the cwd it was spawned in. When a session's folder changes
-   * (or the user switches sessions) the old shell is stale and must be
+   * (or the user switches sessions) every old shell is stale and must be
    * recreated in the new folder.
    */
   async function resetSessionShell(): Promise<void> {
-    await closeTerminal();
+    const ids = terminalTabs.value.map(t => t.id);
+    for (const id of ids) await closeTerminalTab(id);
+    disposeTerminalState();
     if (terminalOpen.value) await ensureTerminal();
   }
 
@@ -575,6 +857,11 @@ export const useAppStore = defineStore('app', () => {
       await ensureTerminal();
       void loadSkills();
     }
+  }
+
+  function renameTerminalTab(id: string, title: string): void {
+    const tab = terminalTabs.value.find(t => t.id === id);
+    if (tab) tab.title = title || tab.title;
   }
 
   async function loadSessionData(id: string): Promise<void> {
@@ -887,12 +1174,16 @@ export const useAppStore = defineStore('app', () => {
     workspace, workspaceBusy, workspaceStale, activeWorkspace, workspacePicker, serverOutdated,
     attachments,
     skills, skillDirectories, skillsBusy, skillsLog,
-    terminalOpen, terminalId, terminalCwd, terminalShell, terminalLines, terminalError, terminalBusy,
+    terminalOpen, terminalId, terminalCwd, terminalShell, terminalPty, terminalLines,
+    terminalError, terminalBusy, terminalOutdated, terminalTabs, activeTerminalId, activeTerminal,
+    terminalShellOptions, terminalDefaultShell, terminalPtyAvailable,
     bootstrap, afterLogin, loadTree, loadChanges, loadAnalytics,
     loadWorkspace, browseWorkspace, openWorkspace,
     openWorkspacePicker, closeWorkspacePicker, chooseWorkspaceFolder, createSessionInCurrentFolder,
     addAttachment, removeAttachment, clearAttachments, attachDeviceFiles, kindOfName,
     loadSkills, installSkill, toggleSkill, removeSkill, pushSkillLog, pushTerminalLine,
+    loadTerminalShells, createTerminalTab, closeTerminalTab, subscribeTerminalData,
+    renameTerminalTab, resizeTerminal, restartTerminal, resetSessionShell,
     ensureTerminal, sendTerminal, interruptTerminal, clearTerminal, closeTerminal, toggleTerminal,
     newSession, selectSession, send, abort, resolvePermission, renameSession, deleteSession,
     setModel, setAgent, saveSettings, addKey, toggleKey, removeKey,

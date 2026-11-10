@@ -151,7 +151,9 @@ async function copyAll() {
           </button>
         </div>
 
-        <TerminalPanel v-if="store.terminalOpen" @close="store.terminalOpen = false" />
+        <!-- v-show keeps the Xterm.js viewports (and their scrollback) alive
+             when the dock is hidden, exactly like an IDE terminal panel. -->
+        <TerminalPanel v-show="store.terminalOpen" @close="store.terminalOpen = false" />
         <Composer ref="composer" />
       </main>
 

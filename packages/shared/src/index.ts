@@ -275,7 +275,8 @@ export interface InstallSkillResult {
 // Terminal (persistent shell used to install skills and run commands)
 // ---------------------------------------------------------------------------
 
-export type TerminalStream = 'stdout' | 'stderr' | 'system' | 'input';
+/** `reset` is a control frame emitted before SSE scrollback replay. */
+export type TerminalStream = 'stdout' | 'stderr' | 'system' | 'input' | 'reset';
 
 export interface TerminalChunk {
   terminalId: string;
@@ -287,9 +288,31 @@ export interface TerminalChunk {
 export interface TerminalState {
   id: string;
   cwd: string;
+  /** Human-readable shell label, e.g. "PowerShell". */
   shell: string;
   running: boolean;
   createdAt: string;
+  /** True when a real PTY (node-pty) backs this terminal; false = piped fallback. */
+  pty: boolean;
+  cols: number;
+  rows: number;
+  /** Shell id used to spawn it, so the UI can preselect it in a new tab. */
+  shellId: string;
+}
+
+export interface TerminalShellInfo {
+  id: string;
+  label: string;
+  command: string;
+  /** Whether the executable was found on this host. */
+  available: boolean;
+}
+
+export interface TerminalShellsResponse {
+  shells: TerminalShellInfo[];
+  defaultShell: string;
+  /** False when node-pty could not be loaded: only line-oriented input works. */
+  pty: boolean;
 }
 
 export interface PermissionRequest {
@@ -402,6 +425,25 @@ export const CreateSessionSchema = z.object({
   agent: z.enum(['build', 'plan', 'general']).optional(),
 });
 
+export const CreateTerminalSchema = z.object({
+  /** Bind the shell's cwd to this chat session's own workspace folder. */
+  sessionId: z.string().min(1).optional(),
+  /** One of the ids returned by GET /api/terminal/shells. */
+  shell: z.string().max(64).optional(),
+  cols: z.number().int().min(20).max(400).optional(),
+  rows: z.number().int().min(4).max(200).optional(),
+});
+
+export const TerminalInputSchema = z.object({
+  /** Raw bytes from Xterm.js `onData`, not a whole command line. */
+  data: z.string(),
+});
+
+export const TerminalResizeSchema = z.object({
+  cols: z.number().int().min(20).max(400),
+  rows: z.number().int().min(4).max(200),
+});
+
 export const UpdateSessionSchema = z.object({
   title: z.string().max(200).optional(),
   agent: z.enum(['build', 'plan', 'general']).optional(),
@@ -506,4 +548,10 @@ export interface HealthResponse {
    * of letting the agent write into whichever folder the account pointer names.
    */
   sessionWorkspaces?: boolean;
+  /**
+   * Advertised by builds whose terminal is backed by a real PTY. A missing flag
+   * means an old server that only accepts whole command lines — the UI must not
+   * forward Xterm.js keystrokes to it.
+   */
+  terminalPty?: boolean;
 }

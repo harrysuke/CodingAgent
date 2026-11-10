@@ -1,0 +1,189 @@
+# Windows release pipeline for the CodingAgent Tauri 2 desktop app.
+#
+# CUTTING A RELEASE
+#   1. Bump the version in ALL FOUR manifests (enforced by the "Validate tag" step):
+#        apps/desktop/src-tauri/tauri.conf.json   -> "version"
+#        apps/desktop/src-tauri/Cargo.toml        -> version = "..."
+#        apps/desktop/package.json                -> "version"
+#        package.json                            -> "version"
+#   2. Commit, tag and push:
+#        git tag v0.2.0
+#        git push origin v0.2.0
+#      Pushing the tag builds the Windows x64 installers and creates/updates
+#      the GitHub Release for that exact tag. Re-run manually by choosing the
+#      tag in the "Run workflow" ref picker (Actions -> this workflow).
+#
+# ONE-TIME REPO SETUP
+#   Settings -> Actions -> General -> Workflow permissions -> "Read and write
+#   permissions", so GITHUB_TOKEN can create the Release (contents: write).
+#
+# OPTIONAL HARDENING
+#   * Unsigned installers trigger Windows SmartScreen warnings. To sign them,
+#     add an Authenticode certificate (base64 .pfx) as a repo secret and set
+#     WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD in the tauri-action
+#     step's env.
+#   * To ship auto-updates, configure plugins.updater, add the
+#     TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD secrets,
+#     uncomment them below and set uploadUpdaterJson: true.
+
+name: Release Windows (Tauri)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never let two builds fight over the same Release assets.
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build & publish Windows x64 installers
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate tag matches app version
+        id: meta
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = $env:REF_NAME
+          if ($tag -match '^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+            $version = $Matches[1]
+          } else {
+            throw "Ref '$tag' is not a version tag. Push a vX.Y.Z tag, or pick the tag in the 'Run workflow' ref picker."
+          }
+
+          $cargoLine = Get-Content 'apps/desktop/src-tauri/Cargo.toml' |
+            Where-Object { $_ -match '^version\s*=' } | Select-Object -First 1
+          $versions = [ordered]@{
+            'apps/desktop/src-tauri/tauri.conf.json' = (Get-Content 'apps/desktop/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).version
+            'apps/desktop/src-tauri/Cargo.toml'      = [regex]::Match($cargoLine, '"([^"]+)"').Groups[1].Value
+            'apps/desktop/package.json'              = (Get-Content 'apps/desktop/package.json' -Raw | ConvertFrom-Json).version
+            'package.json'                           = (Get-Content 'package.json' -Raw | ConvertFrom-Json).version
+          }
+          foreach ($item in $versions.GetEnumerator()) {
+            if ($item.Value -ne $version) {
+              throw "Tag $tag means version $version, but $($item.Key) says '$($item.Value)'. Bump all four version fields before tagging."
+            }
+          }
+
+          $isPrerelease = if ($version.Contains('-')) { 'true' } else { 'false' }
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$version`nprerelease=$isPrerelease`n")
+          Write-Host "Validated $tag -> $version (prerelease: $isPrerelease)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          # Pinned: prepare-desktop.mjs ships this exact node.exe inside the
+          # installer, and better-sqlite3's native addon is built for this ABI.
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Verify better-sqlite3 native addon
+        shell: pwsh
+        run: |
+          node -e "require('better-sqlite3')"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'Native addon not loadable - rebuilding from source...'
+            npm rebuild better-sqlite3 --foreground-scripts
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to build better-sqlite3' }
+            node -e "require('better-sqlite3')"
+            if ($LASTEXITCODE -ne 0) { throw 'better-sqlite3 still not loadable' }
+          }
+
+      - name: Bootstrap .env and SQLite database
+        shell: pwsh
+        run: |
+          # .env and data/*.db are gitignored, so a clean runner must create them.
+          # setup writes .env from .env.example (fresh ENCRYPTION_KEY + token),
+          # db:migrate creates data/codingagent.db with the model catalogue.
+          npm run setup
+          if ($LASTEXITCODE -ne 0) { throw 'npm run setup failed' }
+          npm run db:migrate
+          if ($LASTEXITCODE -ne 0) { throw 'npm run db:migrate failed' }
+
+      - name: Assemble bundled desktop runtime
+        # Runs `npm run build` (shared + server + Vue web), then assembles
+        # apps/desktop/src-tauri/resources/{node,server}: a portable node.exe,
+        # the single-file server bundle, the native addon, web dist and a
+        # SANITIZED database. tauri.conf.json has beforeBuildCommand: "" so
+        # this has to happen before the Tauri build.
+        run: node scripts/prepare-desktop.mjs
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './apps/desktop/src-tauri -> target'
+          cache-on-failure: true
+
+      - name: Build Tauri app and publish GitHub Release
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Enable only when the updater plugin + signing secrets are configured:
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # Monorepo layout: the Tauri CLI and the `tauri` npm script live in
+          # apps/desktop, so the action runs `npm run tauri build` with that
+          # directory as its cwd (where src-tauri/tauri.conf.json is found).
+          projectPath: ./apps/desktop
+          tauriScript: npm run tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: 'CodingAgent v${{ steps.meta.outputs.version }}'
+          releaseBody: |
+            Windows x64 installers for CodingAgent v${{ steps.meta.outputs.version }}, built from `${{ github.ref_name }}`.
+
+            - `*_x64-setup.exe` - NSIS installer (recommended, per-user install)
+            - `*_x64_en-US.msi` - WiX MSI (machine-wide / managed deployments)
+
+            Each installer bundles its own Node.js runtime, server and a clean SQLite database; no developer secrets are shipped.
+          releaseDraft: false
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          generateReleaseNotes: true
+          # No updater plugin configured yet; flip to true when you add one.
+          uploadUpdaterJson: false
+
+      - name: Keep installers on the workflow run
+        uses: actions/upload-artifact@v7
+        with:
+          name: CodingAgent-${{ github.ref_name }}-windows-x64
+          path: apps/desktop/src-tauri/target/release/bundle
+          if-no-files-found: error
+          retention-days: 30
+          # .msi/.exe are already compressed; re-zipping only wastes time.
+          compression-level: 0
+
+      - name: Release summary
+        if: success()
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_URL: ${{ steps.tauri.outputs.releaseHtmlUrl }}
+        run: |
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_STEP_SUMMARY,
+            "## $env:RELEASE_TAG`n`nRelease: $env:RELEASE_URL`n"
+          )

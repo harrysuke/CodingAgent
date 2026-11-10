@@ -201,6 +201,72 @@ async function raw(pathname, init = {}, bearer = '') {
 const request = (p, init = {}) => raw(p, init, token);
 const asUser = (p, init = {}, t = token) => raw(p, init, t);
 
+/**
+ * Attach to a terminal SSE stream and keep pumping frames in the background.
+ * The old terminal sent whole command lines; the Xterm.js terminal sends raw
+ * keystrokes, so tests must observe several round-trips on ONE stream (a body
+ * can only be read once). `waitFor` polls the accumulated frames.
+ */
+async function attachTerminalStream(terminalId, bearer = token) {
+  const streamController = new AbortController();
+  const res = await fetch(
+    `${base}/api/terminal/${encodeURIComponent(terminalId)}/events?token=${encodeURIComponent(bearer)}`,
+    { headers: { Accept: 'text/event-stream' }, signal: streamController.signal },
+  );
+  if (!res.ok) {
+    return { status: res.status, chunks: () => [], frames: () => [], text: () => '', plain: () => '', waitFor: async () => false, close: () => {} };
+  }
+  const frames = [];
+  let frameBuffer = '';
+  let closed = false;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  void (async () => {
+    while (!closed) {
+      let read;
+      try { read = await reader.read(); } catch { break; }
+      if (read.done) break;
+      frameBuffer += decoder.decode(read.value, { stream: true });
+      let boundary;
+      while ((boundary = frameBuffer.indexOf('\n\n')) !== -1) {
+        const frame = frameBuffer.slice(0, boundary);
+        frameBuffer = frameBuffer.slice(boundary + 2);
+        const dataLine = frame.split('\n').find(line => line.startsWith('data: '));
+        if (!dataLine) continue;
+        try { frames.push(JSON.parse(dataLine.slice(6))); } catch { /* malformed frame */ }
+      }
+    }
+  })();
+  const chunks = () => frames.filter(frame => typeof frame.stream === 'string');
+  const text = () => chunks().map(chunk => chunk.data).join('');
+  // PSReadLine colours tokens, so ANSI codes can appear inside an echoed word.
+  const plain = () => text()
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '');
+  const waitFor = async (predicate, timeoutMs = 10_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate(chunks(), text(), frames)) return true;
+      await new Promise(resolve => setTimeout(resolve, 60));
+    }
+    return predicate(chunks(), text(), frames);
+  };
+  return {
+    status: res.status, frames, chunks, text, plain, waitFor,
+    close: () => { closed = true; try { streamController.abort(); } catch { /* already closed */ } },
+  };
+}
+
+/** Wait for a shell side effect (a file it created) instead of guessing a sleep. */
+async function waitForFile(file, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return fs.existsSync(file);
+}
+
 // ---------------------------------------------------------------------------
 // Accounts / BYOK
 // ---------------------------------------------------------------------------
@@ -567,35 +633,149 @@ const enabled = await request(`/api/skills/${encodeURIComponent(installedId)}`, 
 ok('PATCH /api/skills/:id (enable)', enabled.status === 200
   && enabled.body.skills.find(skill => skill.id === installedId)?.enabled === true);
 
-const term = await request('/api/terminal', { method: 'POST' });
-ok('POST /api/terminal (admin shell)', term.status === 201 && !!term.body.id, term.body.shell);
-const termId = term.body.id;
-let termText = '';
-if (termId) {
-  const controller = new AbortController();
-  const res = await fetch(`${base}/api/terminal/${termId}/events?token=${encodeURIComponent(token)}`, {
-    headers: { Accept: 'text/event-stream' }, signal: controller.signal,
-  });
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  await new Promise(resolve => setTimeout(resolve, 700));
-  await request(`/api/terminal/${termId}/input`, {
-    method: 'POST', body: JSON.stringify({ data: 'echo AGENT_TERMINAL_OK' }),
-  });
-  const deadline = Date.now() + 10_000;
-  let buffer = '';
-  while (Date.now() < deadline && !termText.includes('AGENT_TERMINAL_OK')) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    termText = buffer;
-  }
-  controller.abort();
+// Capability flags tell the web client whether it may open an Xterm.js tab.
+const ptyHealth = await request('/api/health');
+ok('GET /api/health advertises PTY terminal support',
+  ptyHealth.body.terminalPty === true, String(ptyHealth.body.terminalPty));
+
+const shells = await request('/api/terminal/shells');
+ok('GET /api/terminal/shells lists usable shells',
+  shells.status === 200 && Array.isArray(shells.body.shells)
+  && shells.body.shells.some(s => s.available) && shells.body.pty === true,
+  `${shells.body.shells?.filter(s => s.available).length ?? 0} available`);
+ok('Default shell is one the host can launch',
+  shells.body.shells?.some(s => s.id === shells.body.defaultShell && s.available) === true,
+  shells.body.defaultShell);
+
+// The shell must start in THIS session's folder, never the account pointer.
+const term = await request('/api/terminal', {
+  method: 'POST',
+  body: JSON.stringify({ sessionId: id, shell: shells.body.defaultShell, cols: 100, rows: 30 }),
+});
+ok('POST /api/terminal (real PTY shell)',
+  term.status === 201 && !!term.body.id && term.body.pty === true,
+  `${term.body.shell} · ${term.body.pty ? 'PTY' : 'pipe'}`);
+ok('Terminal geometry from the viewport is honoured',
+  term.body.cols === 100 && term.body.rows === 30, `${term.body.cols}x${term.body.rows}`);
+if (!useExternal) {
+  ok('Terminal cwd is the session folder, not the account pointer',
+    !!term.body.cwd && path.resolve(term.body.cwd) === path.resolve(bundledWorkspace), term.body.cwd);
 }
-ok('Terminal streamed command output', termText.includes('AGENT_TERMINAL_OK'));
+
+const termId = term.body.id;
+const localFs = !useExternal;
+const probeFile = path.join(bundledWorkspace, 'ca-pty-probe.txt');
+const lineFile = path.join(bundledWorkspace, 'ca-pty-line.txt');
+for (const file of [probeFile, lineFile]) { try { fs.rmSync(file, { force: true }); } catch { /* first run */ } }
+
+let termStream = null;
+if (termId) {
+  termStream = await attachTerminalStream(termId);
+  ok('GET /api/terminal/:id/events opens an SSE stream', termStream.status === 200);
+  await termStream.waitFor((chunks, text) => chunks[0]?.stream === 'reset' && text.includes('CodingAgent terminal'));
+  ok('SSE replay starts with a reset frame (no duplicated scrollback)',
+    termStream.chunks()[0]?.stream === 'reset', termStream.chunks()[0]?.stream);
+  ok('SSE replays the terminal scrollback',
+    termStream.text().includes('CodingAgent terminal'));
+  ok('Scrollback reports a PTY-backed shell',
+    termStream.text().includes('· PTY ·'));
+
+  // Xterm.js forwards individual keystrokes: Enter must be an explicit \r,
+  // not an implicit newline appended by the server (the old pipe behaviour).
+  await request(`/api/terminal/${termId}/input`, {
+    method: 'POST', body: JSON.stringify({ data: 'echo AGENT_PTY_OK > ca-pty-probe.txt\r' }),
+  });
+  await termStream.waitFor((_chunks, text) => text.includes('ca-pty-probe.txt'));
+  ok('PTY echoes raw keystrokes back to the viewport',
+    termStream.plain().includes('echo AGENT_PTY_OK'));
+  if (localFs) {
+    ok('PTY actually executes the submitted command', await waitForFile(probeFile), probeFile);
+    const probeTree = await request(`/api/files/tree?depth=1&sessionId=${encodeURIComponent(id)}`);
+    ok('PTY shell writes into the same folder the session file tree sees',
+      probeTree.status === 200
+      && probeTree.body.entries?.some(entry => entry.name === 'ca-pty-probe.txt'),
+      `${probeTree.body.entries?.length ?? 0} entries`);
+  }
+
+  // A partial line must sit in the shell's line buffer without running.
+  await request(`/api/terminal/${termId}/input`, {
+    method: 'POST', body: JSON.stringify({ data: 'echo AGENT_LINE_OK > ca-pty-line.txt' }),
+  });
+  await termStream.waitFor((_chunks, text) => text.includes('ca-pty-line.txt'));
+  await new Promise(resolve => setTimeout(resolve, 700));
+  if (localFs) {
+    ok('Raw keystrokes are not auto-submitted as a command line',
+      !fs.existsSync(lineFile));
+  }
+  await request(`/api/terminal/${termId}/input`, {
+    method: 'POST', body: JSON.stringify({ data: '\r' }),
+  });
+  if (localFs) {
+    ok('An Enter keystroke completes the buffered line', await waitForFile(lineFile));
+  }
+
+  const resized = await request(`/api/terminal/${termId}/resize`, {
+    method: 'POST', body: JSON.stringify({ cols: 120, rows: 40 }),
+  });
+  ok('POST /api/terminal/:id/resize', resized.status === 200 && resized.body.ok === true);
+  const listed = await request('/api/terminal');
+  const resizedState = listed.body.find(t => t.id === termId);
+  ok('Resize is reflected in the terminal state',
+    resizedState?.cols === 120 && resizedState?.rows === 40,
+    `${resizedState?.cols}x${resizedState?.rows}`);
+  const badResize = await request(`/api/terminal/${termId}/resize`, {
+    method: 'POST', body: JSON.stringify({ cols: 2, rows: 40 }),
+  });
+  ok('Invalid terminal geometry is rejected', badResize.status === 400, `HTTP ${badResize.status}`);
+
+  // Terminal ownership: another account must not type, watch or list it.
+  const userBFresh = useExternal ? '' : (await raw('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: userBEmail, password: 'smoke-user-b-password-2' }),
+  })).body?.token ?? '';
+  if (userBFresh) {
+    const foreignInput = await asUser(`/api/terminal/${termId}/input`, {
+      method: 'POST', body: JSON.stringify({ data: '\r' }),
+    }, userBFresh);
+    ok('Another user cannot type into the terminal', foreignInput.status === 404, `HTTP ${foreignInput.status}`);
+    const foreignEvents = await attachTerminalStream(termId, userBFresh);
+    ok('Another user cannot subscribe to the terminal stream', foreignEvents.status === 404, `HTTP ${foreignEvents.status}`);
+    foreignEvents.close();
+    const foreignList = await asUser('/api/terminal', {}, userBFresh);
+    ok('Another user cannot list the terminal',
+      Array.isArray(foreignList.body) && !foreignList.body.some(t => t.id === termId));
+  }
+
+  const interrupted = await request(`/api/terminal/${termId}/interrupt`, { method: 'POST' });
+  ok('POST /api/terminal/:id/interrupt (Ctrl-C)', interrupted.status === 200 && interrupted.body.ok === true);
+
+  const restarted = await request(`/api/terminal/${termId}/restart`, { method: 'POST' });
+  ok('POST /api/terminal/:id/restart respawns a PTY',
+    restarted.status === 200 && restarted.body.pty === true && restarted.body.id === termId,
+    `${restarted.body.shell} · ${restarted.body.pty ? 'PTY' : 'pipe'}`);
+  ok('Restart keeps the viewport geometry',
+    restarted.body.cols === 120 && restarted.body.rows === 40);
+  await termStream.waitFor((_chunks, text) => text.includes('[shell restarted]'));
+  ok('Restart is announced on the terminal stream',
+    termStream.text().includes('[shell restarted]'));
+
+  const cleared = await request(`/api/terminal/${termId}/clear`, { method: 'POST' });
+  ok('POST /api/terminal/:id/clear', cleared.status === 200 && cleared.body.ok === true);
+  const replay = await attachTerminalStream(termId);
+  await replay.waitFor((_chunks, _text, frames) => frames.some(frame => frame.terminalId === termId && !frame.stream));
+  ok('Clear drops the replay buffer for new viewports',
+    !replay.text().includes('CodingAgent terminal'));
+  replay.close();
+}
 
 const termDeleted = await request(`/api/terminal/${termId}`, { method: 'DELETE' });
 ok('DELETE /api/terminal/:id', termDeleted.body.deleted === true);
+const afterDelete = await request(`/api/terminal/${termId}/input`, {
+  method: 'POST', body: JSON.stringify({ data: '\r' }),
+});
+ok('Deleted terminal rejects further input', afterDelete.status === 404, `HTTP ${afterDelete.status}`);
+termStream?.close();
+for (const file of [probeFile, lineFile]) { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } }
 
 const skillDeleted = await request(`/api/skills/${encodeURIComponent(installedId)}`, { method: 'DELETE' });
 ok('DELETE /api/skills/:id', skillDeleted.status === 200
@@ -695,6 +875,15 @@ fs.rmSync(sessionRoots, { recursive: true, force: true });
 // Cleanup
 const deleted = await request(`/api/sessions/${id}`, { method: 'DELETE' });
 ok('DELETE /api/sessions/:id', deleted.status === 200 && deleted.body.deleted === true);
+
+// Windows ConPTY: node-pty forks a console-list helper on kill(). It must not
+// dump an uncaught "AttachConsole failed" stack trace on every tab close.
+if (!useExternal) {
+  await new Promise(resolve => setTimeout(resolve, 300));
+  ok('PTY shutdown keeps the Windows console-list helper quiet',
+    !serverOutput.includes('AttachConsole failed'),
+    serverOutput.includes('AttachConsole failed') ? 'AttachConsole failed in server log' : 'server log clean');
+}
 
 if (failed && serverOutput) console.log('\n[smoke] isolated server log:\n' + serverOutput.slice(-2500));
 console.log(`\n${passed} passed, ${failed} failed.`);
