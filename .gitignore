@@ -1,0 +1,47 @@
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+.env
+.env.local
+!/.env.example
+
+# SQLite databases: data/codingagent.db holds the encrypted provider API keys
+# (and the inherited model catalog), so it must never be committed. It is
+# machine-local and regenerable with `npm run setup`.
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/backups/
+# Runtime port marker, rewritten on every start
+data/server.port
+# Per-account workspace sandboxes (contain each user's code, never shared)
+data/workspaces/
+# Anything holding a setup/session secret
+data/*.token
+data/*.credentials.json
+# `data/` is 100% machine-local runtime state. A DB *archive* (e.g. the
+# codingagent.zip backup) is just as sensitive as the .db itself, so ignore the
+# whole directory rather than chasing new backup extensions one by one.
+/data/
+
+# Installed Agent Skills and workspace-local agent state
+workspace/.codingagent/
+
+# Tauri build artifacts
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/resources/
+apps/desktop/src-tauri/binaries/*.exe
+apps/desktop/src-tauri/binaries/*-x86_64*
+apps/desktop/src-tauri/binaries/*-aarch64*
+
+logs/
+*.log
+.DS_Store
+
+# Local agent working notes (machine-local, not project source)
+.workbuddy-ai/

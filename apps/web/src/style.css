@@ -1,0 +1,144 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #fbfcfd;
+  --surface-3: #f0f2f5;
+  --border: #e3e6ea;
+  --border-strong: #d2d7de;
+  --text: #151a22;
+  --muted: #6b7482;
+  --faint: #9aa3b0;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-soft: #eef0ff;
+  --accent-text: #4338ca;
+  --green: #16794c;
+  --green-soft: #e7f6ee;
+  --red: #c0392b;
+  --red-soft: #fdecea;
+  --amber: #9a6700;
+  --amber-soft: #fff6d9;
+  --blue: #0969da;
+  --blue-soft: #e8f1ff;
+  --code-bg: #f5f7fa;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 8px 24px rgba(16, 24, 40, .05);
+}
+
+.dark {
+  --bg: #0d1117;
+  --surface: #151b23;
+  --surface-2: #111720;
+  --surface-3: #1c242f;
+  --border: #262e3a;
+  --border-strong: #333d4b;
+  --text: #e6edf3;
+  --muted: #98a2b3;
+  --faint: #6e7681;
+  --accent: #7c8cff;
+  --accent-hover: #93a0ff;
+  --accent-soft: #202645;
+  --accent-text: #a5b0ff;
+  --green: #56d364;
+  --green-soft: #12261a;
+  --red: #ff7b72;
+  --red-soft: #2b1618;
+  --amber: #e3b341;
+  --amber-soft: #2a2210;
+  --blue: #79c0ff;
+  --blue-soft: #12243a;
+  --code-bg: #0b1017;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+/* Tailwind v4 puts utilities (including `.text-white`) in `@layer utilities`.
+   An unlayered `color: inherit` would outrank them and make buttons inherit
+   the dark body text, so keep base resets inside `@layer base` where utilities
+   can win. See the primary-button rule below. */
+@layer base {
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+}
+button:disabled { cursor: not-allowed; opacity: .5; }
+
+/* Primary buttons sit on a solid accent/red background: keep their labels
+   white even if another reset is introduced later. `:not(:disabled)` leaves
+   intentional disabled styling (e.g. the Send button's faint text) intact. */
+button.text-white:not(:disabled) { color: #fff; }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--faint); background-clip: padding-box; }
+
+.surface { background: var(--surface); border: 1px solid var(--border); }
+.hairline { border-color: var(--border); }
+.hover-soft:hover { background: var(--surface-3); }
+.focus-ring:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- Markdown / prose ---------- */
+.prose-agent { font-size: 14px; line-height: 1.7; word-break: break-word; }
+.prose-agent > *:first-child { margin-top: 0; }
+.prose-agent > *:last-child { margin-bottom: 0; }
+.prose-agent p { margin: 0 0 10px; }
+.prose-agent h1, .prose-agent h2, .prose-agent h3, .prose-agent h4 {
+  margin: 18px 0 8px; font-weight: 650; line-height: 1.3;
+}
+.prose-agent h1 { font-size: 1.3em; } .prose-agent h2 { font-size: 1.18em; } .prose-agent h3 { font-size: 1.06em; }
+.prose-agent ul, .prose-agent ol { margin: 8px 0 12px; padding-left: 22px; }
+.prose-agent li { margin: 3px 0; }
+.prose-agent ul { list-style: disc; } .prose-agent ol { list-style: decimal; }
+.prose-agent a { color: var(--accent-text); text-decoration: underline; text-underline-offset: 2px; }
+.prose-agent blockquote { border-left: 3px solid var(--border-strong); padding-left: 12px; color: var(--muted); margin: 10px 0; }
+.prose-agent hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+.prose-agent table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; display: block; overflow-x: auto; }
+.prose-agent th, .prose-agent td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.prose-agent th { background: var(--surface-3); font-weight: 600; }
+.prose-agent :not(pre) > code {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px;
+  padding: 1px 5px; font-size: .88em; font-family: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+}
+.prose-agent pre {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; overflow-x: auto; margin: 10px 0; font-size: 12.5px; line-height: 1.6;
+}
+.prose-agent pre code { font-family: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace; }
+.prose-agent pre .shiki { background: transparent !important; }
+
+/* Shiki dual-theme tokens */
+html:not(.dark) .shiki span { color: var(--shiki-light); }
+.dark .shiki span { color: var(--shiki-dark); }
+
+/* ---------- Diff ---------- */
+.diff-line { display: flex; gap: 10px; font-family: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace; font-size: 12px; line-height: 1.55; white-space: pre; padding: 0 10px; }
+.diff-add { background: var(--green-soft); color: var(--green); }
+.diff-del { background: var(--red-soft); color: var(--red); }
+.diff-hunk { background: var(--blue-soft); color: var(--blue); }
+.diff-meta { color: var(--muted); background: var(--surface-3); }
+
+/* ---------- Animations ---------- */
+@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: .2 } }
+.cursor-blink { animation: blink 1s ease-in-out infinite; }
+@keyframes fade-up { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: none } }
+.fade-up { animation: fade-up .22s ease-out both; }
+@keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(79,70,229,.35) } 70% { box-shadow: 0 0 0 8px rgba(79,70,229,0) } 100% { box-shadow: 0 0 0 0 rgba(79,70,229,0) } }
+.pulse-ring { animation: pulse-ring 1.8s infinite; }
+
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+.safe-top { padding-top: env(safe-area-inset-top, 0px); }
