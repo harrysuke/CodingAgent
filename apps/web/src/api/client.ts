@@ -4,13 +4,56 @@ import type {
 } from '@codingagent/shared';
 
 const LS_URL = 'codingagent.serverUrl';
+/**
+ * Set when the desktop shell - not the user - wrote LS_URL. Sidecar ports are
+ * reassigned on every launch, so an auto-written URL is disposable; a URL the
+ * user typed in Settings > Connection must be preserved.
+ */
+const LS_URL_AUTO = 'codingagent.serverUrlAuto';
 /** Per-account session token. NOT the old shared AGENT_TOKEN. */
 const LS_TOKEN = 'codingagent.token';
 const LEGACY_TOKEN = 'change-me-local-dev-token';
+/**
+ * The single-origin server started by `npm start` / `npm run dev`. Matches
+ * `PORT` in .env and the Vite proxy target in vite.config.ts. Used when the
+ * desktop sidecar is unavailable (or `tauri dev`, which disables it).
+ */
+export const DEFAULT_SERVER_ORIGIN = normalizeServerUrl(
+  (import.meta.env?.VITE_AGENT_SERVER as string | undefined) || 'http://127.0.0.1:4317',
+);
+
+/**
+ * The agent binds IPv4 only (HOST=127.0.0.1). On Windows `localhost` may
+ * resolve to ::1 first, so a loopback URL written with that hostname can fail
+ * with "failed to fetch" even while the server is listening.
+ */
+export function normalizeServerUrl(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname === 'localhost') parsed.hostname = '127.0.0.1';
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return trimmed;
+  }
+}
+
+/** True for a dead URL left by an older build: loopback + OS-assigned port. */
+export function isStaleSidecarUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost' && parsed.hostname !== '[::1]') return false;
+    const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+    return Number.isFinite(port) && port >= 49152;
+  } catch {
+    return false;
+  }
+}
 
 export const connection = reactive({
   /** Empty string = same origin (Vite proxy in dev, Node-served UI on desktop web build). */
-  url: localStorage.getItem(LS_URL) ?? '',
+  url: normalizeServerUrl(localStorage.getItem(LS_URL) ?? ''),
   token: localStorage.getItem(LS_TOKEN) ?? '',
   /**
    * Desktop-only hint: the Rust sidecar hands us its AGENT_TOKEN so the
@@ -46,9 +89,20 @@ if (connection.token === LEGACY_TOKEN) {
   localStorage.removeItem(LS_TOKEN);
 }
 
+/**
+ * `auto` marks URLs written by the desktop shell. User-supplied URLs are sticky;
+ * auto URLs are replaced whenever the shell reports a different server.
+ */
+function setServerUrlValue(url: string, auto: boolean): void {
+  connection.url = normalizeServerUrl(url);
+  if (connection.url) localStorage.setItem(LS_URL, connection.url);
+  else localStorage.removeItem(LS_URL);
+  if (auto) localStorage.setItem(LS_URL_AUTO, '1');
+  else localStorage.removeItem(LS_URL_AUTO);
+}
+
 export function setServerUrl(url: string): void {
-  connection.url = url.replace(/\/+$/, '');
-  localStorage.setItem(LS_URL, connection.url);
+  setServerUrlValue(url, false);
 }
 
 export function setSessionToken(token: string): void {
@@ -74,17 +128,63 @@ function isTauri(): boolean {
  * On the Tauri desktop shell the Rust side starts the Node sidecar and hands
  * us its loopback URL + setup token. Mobile has no sidecar, so it keeps
  * whatever LAN/remote server the user configured in Settings > Connection.
+ *
+ * A built sidecar picks a NEW random port (`free_port()` in src/lib.rs) on
+ * every launch. If startup fails - or in `tauri dev`, where the sidecar is
+ * disabled - `get_server_config` returns null and an old URL such as
+ * `http://localhost:51474` would otherwise stay in localStorage forever and
+ * produce "Cannot reach the agent server ... (failed to fetch)". Auto-written
+ * and stale-ephemeral URLs are therefore replaced here, while a URL the user
+ * explicitly entered is never overwritten.
  */
 export async function initConnection(): Promise<void> {
   connection.mode = isTauri() ? (/Android|iPhone|iPad/i.test(navigator.userAgent) ? 'mobile' : 'tauri') : 'browser';
-  if (!isTauri()) return;
+
+  // Repair a value written by an older build (e.g. `localhost` instead of the
+  // IPv4 loopback address the server actually binds).
+  const saved = localStorage.getItem(LS_URL) ?? '';
+  const normalized = normalizeServerUrl(saved);
+  if (saved !== normalized) {
+    if (normalized) localStorage.setItem(LS_URL, normalized);
+    else localStorage.removeItem(LS_URL);
+  }
+  connection.url = normalized;
+  const auto = localStorage.getItem(LS_URL_AUTO) === '1';
+
+  if (!isTauri()) {
+    // A dead sidecar port is meaningless in the browser: fall back to the
+    // same-origin server (Vite proxy in dev, Node-served UI via `npm start`).
+    if (isStaleSidecarUrl(connection.url)) setServerUrlValue('', false);
+    return;
+  }
+  if (connection.mode === 'mobile') return; // LAN/remote URL is user-owned
+
+  let cfg: { url?: string; token?: string } | null = null;
+  let status = '';
   try {
     const { invoke } = await import('@tauri-apps/api/core');
-    const cfg = await invoke<{ url?: string; token?: string } | null>('get_server_config');
-    if (cfg?.url) setServerUrl(String(cfg.url));
-    if (cfg?.token) connection.setupTokenHint = String(cfg.token);
+    cfg = await invoke<{ url?: string; token?: string } | null>('get_server_config');
+    status = await invoke<string>('get_server_status').catch(() => '');
   } catch (err) {
     console.warn('[connection] Tauri server config unavailable, using saved settings:', err);
+  }
+
+  if (cfg?.token) connection.setupTokenHint = String(cfg.token);
+  // `get_server_config` gives up after 20 s while health waits up to 30 s, so
+  // a sidecar that became ready in that window is recoverable from the status.
+  const readyUrl = status.startsWith('ready ') ? status.slice(6).trim() : '';
+  const liveUrl = cfg?.url ? String(cfg.url) : readyUrl;
+  if (liveUrl) {
+    setServerUrlValue(liveUrl, true);
+    return;
+  }
+
+  // `tauri dev`: empty URL = same origin, and Vite proxies /api to :4317.
+  // Packaged build with a failed sidecar: use the `npm start` server directly
+  // (CORS is open), which is what a developer expects when that server is up.
+  const fallback = status === 'external' ? '' : DEFAULT_SERVER_ORIGIN;
+  if (auto || !connection.url || isStaleSidecarUrl(connection.url)) {
+    setServerUrlValue(fallback, true);
   }
 }
 

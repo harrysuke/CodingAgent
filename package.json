@@ -31,7 +31,8 @@
     "mobile:android:dev": "npm run mobile:android:dev -w @codingagent/desktop",
     "mobile:ios:dev": "npm run mobile:ios:dev -w @codingagent/desktop",
     "smoke": "node scripts/smoke-test.mjs",
-    "smoke:fresh": "node scripts/check-fresh-db.mjs"
+    "smoke:fresh": "node scripts/check-fresh-db.mjs",
+    "check:connection": "tsx scripts/check-server-url.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

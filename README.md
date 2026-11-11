@@ -558,6 +558,15 @@ The generated `src-tauri/gen/android` / `gen/ios` projects are gitignored.
   from that provider.
 - **Desktop window is blank / offline** — check `<app-data>/server.log`; the
   sidecar readiness timeout is 30 s, `get_server_config` waits up to 20 s.
+- **`Cannot reach the agent server at http://localhost:51474`** (any random
+  5-digit port) — that is a *cached* sidecar port, not a setting in this repo.
+  A packaged sidecar gets a new `free_port()` on every launch, so a saved URL
+  dies when the app restarts. `initConnection()` now drops auto-generated /
+  stale loopback URLs and uses the live sidecar URL, or falls back to
+  `http://127.0.0.1:4317` (`npm start`) / the same-origin Vite proxy in
+  `tauri dev`; it also rewrites `localhost` to `127.0.0.1` because the server
+  binds IPv4 only. A URL typed in **Settings → Connection** is never
+  overwritten. Verify with `npm run check:connection`.
 - **Mobile cannot connect** — the server must bind `0.0.0.0`, the phone must be
   on the same network, and the firewall must allow port 4317. Use HTTPS or a
   tunnel for access over the public internet.

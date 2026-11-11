@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   ArrowLeft, Server, Database, KeyRound, SlidersHorizontal, BarChart3, Plus, Trash2,
@@ -25,6 +25,8 @@ const sections = [
 ] as const;
 
 const urlInput = ref(connection.url);
+// initConnection() can repair a stale sidecar URL after this view was created.
+watch(() => connection.url, value => { urlInput.value = value; });
 const passwordDraft = reactive({ current: '', next: '', confirm: '' });
 const passwordBusy = ref(false);
 const passwordMessage = ref<{ ok: boolean; text: string } | null>(null);
